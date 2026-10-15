@@ -1,0 +1,41 @@
+# === Python (PyQt6 / Data Pipeline) ===
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.log
+*.csv                  # Ignore session data dumps / test run CSVs
+*.parquet
+*.sqlite3
+
+# === Vivado / Basys 3 FPGA Artifacts ===
+*.jou
+*.log
+*.str
+.Xil/
+*.hw/
+*.runs/
+*.cache/
+*.ip_user_files/
+*.sim/
+# Keep bitstreams only if your team explicitly wants release binaries tracked:
+# *.bit
+
+# === Altium Designer ===
+History/
+__Previews/
+*.PrjPcbVariants
+*.OutJob
+*.html
+*.htm
+*.zip
+Output/
+Project Outputs for */
+
+# === OS / Editors ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
