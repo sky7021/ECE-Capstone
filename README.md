@@ -1,87 +1,99 @@
+Repository Structure
+
+```text
 ece490-qcm-platform/
 │
-├── .gitignore                          # Ignores build artifacts, IDE configs, raw test sessions
-├── README.md                           # System overview, quickstart, pinout map, flashing guide
-├── requirements.txt                    # Pinned Python dependencies for GUI and data pipeline
+├── .gitignore                          # Ignores build artifacts, logs, and CSV dumps
+├── README.md                           # Project documentation and setup guide
+├── requirements.txt                    # Python dependencies (PyQt6, pyqtgraph, etc.)
 │
-├── software/                           # [Kevin Wu] Host PC Integration & Real-Time Analytics
-│   ├── gui/                            # Presentation Layer (PyQt6 / PySide6 + pyqtgraph)
-│   │   ├── __init__.py
-│   │   ├── app.py                      # Application entry point, QEventLoop lifecycle
-│   │   ├── main_window.py              # Main dashboard window, docking layouts, menu actions
-│   │   ├── views/                      # Specialized UI views
-│   │   │   ├── time_series_view.py     # Hardware-accelerated pyqtgraph streaming charts
-│   │   │   ├── spectrum_view.py        # Real-time FFT / peak-tracking display
-│   │   │   └── diagnostic_view.py      # Fan PWM sliders, serial port selectors, sensor health
-│   │   └── widgets/                    # Modular PyQt widgets
-│   │       ├── dynamic_ribbon.py       # Mean trajectory with ±1σ confidence ribbon
-│   │       └── status_indicator.py     # Port connection states, dropped frame counters
-│   │
-│   ├── readers/                        # Asynchronous Hardware Ingestion Layer
-│   │   ├── __init__.py
-│   │   ├── serial_worker.py            # Base QThread / QRunnable serial reader template
-│   │   ├── qcm_reader.py               # FPGA packet consumer, binary unpacker (0xAA 0x55)
-│   │   ├── aux_reader.py               # ESP32 telemetry parser (ADC flow, SHT21, CRC verify)
-│   │   └── smps_adapter.py             # Delimited TSI-AIM / SMPS file watcher & scan parser
-│   │
-│   ├── pipeline/                       # Signal Processing & Domain Transformation
-│   │   ├── __init__.py
-│   │   ├── packet_definitions.py       # C-struct byte alignment definitions (`struct` format)
-│   │   ├── clock_mapper.py             # Affine time mapping (t_PC = a * t_device + b), drift
-│   │   ├── zoh_fusion.py               # Zero-Order Hold state buffer for multi-rate merging
-│   │   ├── sauerbrey.py                # Differential subtraction & static/derivative Sauerbrey
-│   │   ├── empirical_fit.py            # Scan-aware dose integration & K_empirical derivation
-│   │   ├── quality.py                  # CRC verification, bounds check, stale hold detection
-│   │   └── raw_logger.py               # Immutable CSV / Parquet session logger by date & ID
-│   │
-│   └── tests/                          # Hardware-Decoupled Prototyping & Emulation
-│       ├── __init__.py
-│       ├── serial_mock.py              # Synthetic dual-QCM & ESP32 telemetry generator
-│       ├── virtual_loopback.py         # Virtual COM port pair manager (socat / com0com)
-│       └── test_pipeline.py            # Unit tests for Sauerbrey, ZOH, and packet framing
+├── software/                           # [Kevin Wu] Host PC GUI & Analytics Pipeline
+│   ├── gui/                            # PyQt6 + pyqtgraph presentation dashboard
+│   │   ├── app.py                      # Application entry point and event loop
+│   │   ├── main_window.py              # Parent window and docking layout
+│   │   ├── views/                      # Real-time streaming charts and controls
+│   │   └── widgets/                    # Diagnostic status and confidence ribbons
+│   ├── readers/                        # Dedicated asynchronous serial worker threads
+│   │   ├── qcm_reader.py               # FPGA 10 Hz binary packet parser
+│   │   ├── aux_reader.py               # ESP32 telemetry parser and CRC validator
+│   │   └── smps_adapter.py             # Delimited SMPS file watcher and scan parser
+│   ├── pipeline/                       # Signal processing and calibration math
+│   │   ├── packet_definitions.py       # C-struct byte alignment schemas
+│   │   ├── zoh_fusion.py               # Zero-Order Hold multi-rate data fusion
+│   │   ├── sauerbrey.py                # Differential subtraction & Sauerbrey model
+│   │   ├── empirical_fit.py            # Dose-domain integral transform (K_empirical)
+│   │   └── raw_logger.py               # Immutable CSV session logger
+│   └── tests/                          # Hardware-decoupled emulation
+│       ├── serial_mock.py              # Synthetic QCM & ESP32 telemetry generator
+│       └── virtual_loopback.py         # Virtual COM port pair manager
 │
-├── firmware/                           # Embedded Hardware Logic & Microcontroller Code
-│   ├── fpga/                           # [Ashraf Illiyas] Basys 3 AMD Artix-7 (XC7A35T) Vivado
-│   │   ├── constraints/
-│   │   │   └── basys3_master.xdc       # Pin constraints: 100MHz clock, Pmod JA/JB, UART TX/RX
-│   │   ├── rtl/                        # Synthesizable VHDL / Verilog source files
-│   │   │   ├── top_qcm_reader.v        # Top-level integration wrapper
-│   │   │   ├── reciprocal_counter.v    # High-resolution frequency counter (<1 Hz resolution)
-│   │   │   ├── cdc_synchronizer.v      # Multi-stage synchronizer for clock domain crossing
-│   │   │   ├── dual_clock_fifo.v       # Asynchronous BRAM FIFO (100 MHz count to UART baud)
-│   │   │   ├── packet_encoder.v        # Binary frame assembler (sync header, sequence, CRC)
-│   │   │   └── uart_tx.v               # 115,200 / 921,600 baud serial transmitter
-│   │   └── ip/                         # Vivado IP configurations (Clocking Wizard, XADC, FFT)
-│   │
+├── firmware/                           # Embedded Firmware & Digital Logic
+│   ├── fpga/                           # [Ashraf Illiyas] Basys 3 AMD Artix-7 Vivado
+│   │   ├── constraints/                # Basys 3 master pin constraints (.xdc)
+│   │   ├── rtl/                        # Synthesizable Verilog (counter, CDC, FIFO, UART)
+│   │   └── ip/                         # Vivado IP configurations
 │   └── esp32/                          # [Ian Howie] ESP-IDF / Arduino C++ Firmware
-│       ├── src/
-│       │   ├── main.cpp                # FreeRTOS task initialization & timer scheduling
-│       │   ├── adc_flow.cpp            # Omron D6F-V03A1 12-bit ADC acquisition & rolling average
-│       │   ├── sht21_driver.cpp        # SHT21 I2C driver (0.5 Hz polling to stop self-heating)
-│       │   ├── fan_pwm.cpp             # 5V fan PWM modulation via ESP32 LEDC / MCPWM
-│       │   ├── packet_builder.cpp      # Binary telemetry framing & CRC16-CCITT calculation
-│       │   └── cmd_parser.cpp          # Inbound serial parser for host GUI PWM commands
-│       └── include/
-│           ├── pin_mapping.h           # ESP32 GPIO assignments (ADC, I2C, PWM, UART)
-│           └── telemetry_schema.h      # Shared binary struct definitions matching PC Python
+│       ├── src/                        # FreeRTOS tasks (ADC, SHT21 I2C, PWM, CRC)
+│       └── include/                    # Pin mapping and shared telemetry headers
 │
-├── hardware/                           # [Adria Trilla Castello] PCB & Mechanical Design
-│   ├── schematics/                     # Altium Designer project files (.PrjPcb, .SchDoc)
-│   │   ├── QCM_Analog_Front_End.SchDoc # Transimpedance amplifier, bandpass filter, comparator
-│   │   └── MCU_Sensor_Interface.SchDoc # ESP32 level shifting, fan FET driver, pull-ups
-│   ├── pcb/                            # Altium board layouts (.PcbDoc), Gerbers, drill tables
-│   │   ├── QCM_Board.PcbDoc            # Controlled 50-ohm RF traces, SMA connectors
-│   │   └── Manufacturing_Outputs/      # Gerbers (RS-274X), BOM, Pick-and-Place (XYRS)
-│   └── 3d_models/                      # Mechanical Housing & Fixtures (STEP / STL)
-│       ├── testing_duct.step           # Aerodynamic flow duct CAD model
-│       ├── sensor_fixture.stl          # 3D printable dual-crystal chamber insert
-│       └── fan_guard_adapter.stl       # Protective fan mount and airflow collimator
+├── hardware/                           # [Adria Trilla Castello] PCB & Chamber Design
+│   ├── schematics/                     # Altium Designer schematics (.SchDoc)
+│   ├── pcb/                            # Altium board layouts and Gerber outputs
+│   └── 3d_models/                      # Flow duct and dual-resonator chamber STLs
 │
-└── docs/                               # Project Traceability, Calibration & Specifications
-    ├── research/                       # Research Run Reports (Runs 1, 2, 3)
-    ├── datasheets/                     # Vendor component references (Basys 3, ESP32, SHT21)
-    ├── icd/
-    │   └── interface_control_doc.md    # Strict hardware-software packet framing contract
-    ├── calibration/
-    │   └── calibration_manifest.json   # SMPS cross-calibration constants & chamber volumes
-    └── meeting_minutes/                # Weekly supervisor & client agendas (Dr. Zhang)
+└── docs/                               # Engineering Documentation & Specs
+    ├── icd/                            # Interface Control Document (packet framing)
+    ├── calibration/                    # Chamber volumes and calibration manifests
+    └── research/                       # Research Run Reports and sensor datasheets
+```
+
+---
+
+## Team Roles & Responsibilities
+
+| Name | Role | Primary Directory | Core Deliverables |
+| :--- | :--- | :--- | :--- |
+| **Ashraf Illiyas** | FPGA & Resonator Lead | `/firmware/fpga/` | Reciprocal counter RTL (<1 Hz res), CDC synchronizer, dual-clock FIFO, UART packetizer. |
+| **Ian Howie** | Embedded Firmware Lead | `/firmware/esp32/` | ESP32 ADC flow driver, SHT21 I2C driver (0.5 Hz duty), fan PWM modulation, CRC16 checking. |
+| **Adria Trilla Castello** | Hardware & Mechanics Lead | `/hardware/` | Altium analog front-end schematic/PCB, flow duct 3D model, dual-crystal PTFE chamber fixture. |
+| **Kevin Wu** | Software & Integration Lead | `/software/` | PyQt6/pyqtgraph real-time GUI, threaded serial ingestion, ZOH data fusion, empirical SMPS calibration. |
+
+---
+
+## Software Quickstart
+
+### Prerequisites
+
+* Python 3.10+ installed
+* Git installed
+
+### Installation
+
+1. **Clone the repository:**
+   ```bash
+   git clone [https://github.com/sky7021/ECE-Capstone.git](https://github.com/sky7021/ECE-Capstone.git)
+   cd ECE-Capstone
+   ```
+
+2. **Create and activate a virtual environment:**
+   ```bash
+   # Windows
+   python -m venv .venv
+   .venv\Scripts\activate
+
+   # Linux / macOS
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Launch the GUI with simulated hardware (Mock Mode):**
+   ```bash
+   python software/gui/app.py --mock
+   ```
+
+---
