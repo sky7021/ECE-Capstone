@@ -1,0 +1,8 @@
+PyQt6>=6.5
+pyqtgraph>=0.13
+pyserial>=3.5
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+pytest>=8.0
+
