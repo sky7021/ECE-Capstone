@@ -567,14 +567,40 @@ class TestFullStackIntegration:
         assert win.current_state is HostState.S0_DISCONNECTED
         app_ctrl.shutdown()
 
+    def test_gui_unified_host_controller_and_main_window(self, tmp_path, waiter):
+        """Step 4: Verify direct unified HostController + MainWindow architecture."""
+        cfg = HostConfig(
+            mock=True,
+            log_dir=str(tmp_path / "gui_direct_unified"),
+            mock_period_s=0.05,
+            qcm_timeout_s=1.5,
+            flow_timeout_s=1.5,
+            sht_timeout_s=3.0,
+        )
+        ctrl = HostController(cfg)
+        win = MainWindow(controller=ctrl, modal_enabled=False)
 
-def load_tests(loader, tests, pattern):
-    from software.tests._pytest_shim import build_unittest_suite
+        assert win.current_state is HostState.S0_DISCONNECTED
+        assert ctrl.connect_ports()
+        assert win.current_state is HostState.S1_IDLE_STANDBY
 
-    return build_unittest_suite(sys.modules[__name__])
+        win.on_start_run_clicked()
+        assert win.current_state is HostState.S2_TARE_AND_PRIME
+        assert waiter(
+            lambda: win.current_state is HostState.S3_ACTIVE_STREAMING
+            and len(win.time_series_view.t_buf) >= 2,
+            timeout=3.0,
+        )
+
+        win.on_fan_slider_changed(55)
+        assert win.current_state is HostState.S3_ACTIVE_STREAMING
+        assert win.history_state is HostState.S3_ACTIVE_STREAMING
+
+        win.on_fault_triggered("Simulated cable pull")
+        assert win.current_state is HostState.S4_FAULT
+        win.on_fault_modal_confirmed()
+        assert win.current_state is HostState.S0_DISCONNECTED
+        ctrl.shutdown()
 
 
-if __name__ == "__main__":
-    from software.tests._pytest_shim import run_module
 
-    sys.exit(run_module(sys.modules[__name__]))

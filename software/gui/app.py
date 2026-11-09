@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import QApplication
 
 from software.fsm.host_controller import (
     HostConfig,
+    HostController,
     ReaderFactory,
     default_reader_factory,
 )
@@ -43,7 +44,7 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 class ApplicationController(QObject):
-    """Top-level orchestrator wiring readers, ZOH fusion, CSV logger and MainWindow."""
+    """Backwards-compatible adapter delegating to unified HostController and MainWindow."""
 
     def __init__(
         self,
@@ -55,78 +56,45 @@ class ApplicationController(QObject):
         super().__init__(parent)
         self.config = config or HostConfig(mock=True)
         self._reader_factory = reader_factory or default_reader_factory
-        self.qcm_reader: Optional[QCMReader] = None
-        self.aux_reader: Optional[AuxReader] = None
         if main_window is not None:
             self.main_window = main_window
-            self.zoh_fusion = main_window.zoh_fusion
-            self.zoh_fusion.flow_timeout_s = self.config.flow_timeout_s
-            self.zoh_fusion.sht_timeout_s = self.config.sht_timeout_s
-            self.csv_logger = main_window.csv_logger
-            self.csv_logger.log_dir = Path(self.config.log_dir)
+            self.controller = HostController(
+                self.config, reader_factory=self._reader_factory, parent=self
+            )
+            self.main_window.set_controller(self.controller)
         else:
-            self.zoh_fusion = ZOHFusionEngine(
-                flow_timeout_s=self.config.flow_timeout_s,
-                sht_timeout_s=self.config.sht_timeout_s,
-                parent=self,
+            self.controller = HostController(
+                self.config, reader_factory=self._reader_factory, parent=self
             )
-            self.csv_logger = CSVLogger(self.config.log_dir)
-            self.main_window = MainWindow(
-                zoh_fusion=self.zoh_fusion,
-                csv_logger=self.csv_logger,
-                modal_enabled=False,
-            )
-        self._signals_bound = False
+            self.main_window = MainWindow(controller=self.controller, modal_enabled=False)
+
+    @property
+    def qcm_reader(self) -> Optional[QCMReader]:
+        return self.controller.qcm_reader
+
+    @property
+    def aux_reader(self) -> Optional[AuxReader]:
+        return self.controller.aux_reader
+
+    @property
+    def zoh_fusion(self) -> ZOHFusionEngine:
+        return self.controller.engine
+
+    @property
+    def csv_logger(self) -> CSVLogger:
+        return self.controller.csv_logger
 
     def init_workers(self) -> bool:
-        """Execute ``S0 -> HS_CONNECTED (S1: IDLE)`` guard check, open ports & start workers."""
-        cfg = self.config
-        if not cfg.mock and not (cfg.qcm_port and cfg.aux_port):
-            return False
-
-        qcm, aux = self._reader_factory(cfg)
-        if not qcm.open_port() or not aux.open_port():
-            qcm.stop_and_close()
-            aux.stop_and_close()
-            return False
-
-        self.qcm_reader = qcm
-        self.aux_reader = aux
-        self.main_window.qcm_reader = qcm
-        self.main_window.aux_reader = aux
-        self.bind_signals()
-        qcm.start()
-        aux.start()
-        self.main_window.on_ports_connected()
-        return True
-
-    def bind_signals(self) -> None:
-        """Wire reader, fusion, logger, and MainWindow signals and fault slots."""
-        if not self._signals_bound:
-            self.zoh_fusion.fused_row_ready.connect(self.csv_logger.log_fused_row)
-            self.zoh_fusion.fused_row_ready.connect(self.main_window.update_plots)
-            self.zoh_fusion.staleness_fault.connect(self.main_window.on_fault_triggered)
-            self._signals_bound = True
-
-        if self.qcm_reader is not None:
-            self.qcm_reader.qcm_packet_received.connect(self.zoh_fusion.ingest_qcm)
-            self.qcm_reader.serial_fault.connect(self.main_window.on_fault_triggered)
-        if self.aux_reader is not None:
-            self.aux_reader.aux_packet_received.connect(self.zoh_fusion.ingest_aux)
-            self.aux_reader.serial_fault.connect(self.main_window.on_fault_triggered)
+        """``S0 -> S1`` boot ports and readers."""
+        return self.controller.connect_ports()
 
     def shutdown(self) -> None:
-        """Execute ``HS_CONNECTED -> S0: DISCONNECTED`` direct termination."""
-        self.main_window.fsm.shutdown()
-        self.csv_logger.flush_and_close()
-        if self.qcm_reader is not None:
-            self.qcm_reader.stop_and_close()
-        if self.aux_reader is not None:
-            self.aux_reader.stop_and_close()
+        """Execute graceful shutdown."""
+        self.controller.shutdown()
 
 
 def configure_signal_handling(
-    app: QCoreApplication, controller: ApplicationController
+    app: QCoreApplication, controller: HostController
 ) -> QTimer:
     """Trap ``SIGINT`` and ``SIGTERM`` to invoke ``controller.shutdown()``."""
 
@@ -154,11 +122,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         baud=args.baud,
         log_dir=args.log_dir,
     )
-    window = MainWindow(modal_enabled=True)
-    controller = ApplicationController(config=config, main_window=window)
+
+    controller = HostController(config)
+    window = MainWindow(controller=controller, modal_enabled=True)
     _keepalive = configure_signal_handling(app, controller)
-    controller.init_workers()
+    controller.connect_ports()
     window.show()
+
     app.aboutToQuit.connect(controller.shutdown)
     return app.exec()
 

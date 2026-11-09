@@ -15,25 +15,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-try:
-    import serial  # type: ignore[import-untyped]
-except ModuleNotFoundError:  # pragma: no cover - fallback when pyserial is not installed
-
-    class _SerialFallback:
-        EIGHTBITS = 8
-        PARITY_NONE = "N"
-        STOPBITS_ONE = 1
-
-        class SerialException(OSError):
-            pass
-
-        class Serial:
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                raise _SerialFallback.SerialException(
-                    "pyserial is not installed in the active Python environment"
-                )
-
-    serial = _SerialFallback()  # type: ignore[assignment]
+import serial
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QMainWindow, QMessageBox, QVBoxLayout, QWidget
 
+from software.fsm.host_controller import HostConfig, HostController
 from software.fsm.host_fsm import HostState, HostStateMachine, Transition
 from software.gui.views.diagnostic_view import DiagnosticView
 from software.gui.views.time_series_view import TimeSeriesView
@@ -20,97 +21,30 @@ from software.readers.qcm_reader import QCMReader
 __all__ = ["HostState", "MainWindow"]
 
 
-class _WindowActions:
-    """Adapts a standalone :class:`MainWindow` to the :class:`HostActions` protocol."""
-
-    def __init__(self, win: "MainWindow") -> None:
-        self._w = win
-
-    def ports_available(self) -> bool:
-        return True
-
-    def ports_healthy(self) -> bool:
-        q, a = self._w.qcm_reader, self._w.aux_reader
-        if q is None and a is None:
-            return True
-        return q is not None and a is not None and q.is_healthy and a.is_healthy
-
-    def open_hardware(self) -> bool:
-        return True
-
-    def begin_session(self) -> None:
-        w = self._w
-        armed_at = time.monotonic()
-        if w.qcm_reader is not None:
-            w.qcm_reader.purge_input_buffer()
-        if w.aux_reader is not None:
-            w.aux_reader.purge_input_buffer()
-        w.csv_logger.open_session_csv()
-        w.zoh_fusion.reset_for_tare(armed_at)
-
-    def begin_streaming(self, f0_hz: int, t0_c: float) -> None:
-        pass
-
-    def transmit_pwm(self, duty: int) -> None:
-        if self._w.aux_reader is not None:
-            self._w.aux_reader.send_pwm_command(duty)
-
-    def park_hardware(self, reason: str) -> None:
-        self._release()
-
-    def show_fault(self, reason: str) -> None:
-        self._w._present_fault_modal(reason)
-
-    def clear_fault(self) -> None:
-        self._w._reset_ui_on_disconnect()
-
-    def terminate(self) -> None:
-        self._release()
-
-    def _release(self) -> None:
-        w = self._w
-        w.zoh_fusion.invalidate()
-        try:
-            w.csv_logger.flush_and_close()
-        finally:
-            if w.qcm_reader is not None:
-                w.qcm_reader.stop_and_close()
-            if w.aux_reader is not None:
-                w.aux_reader.stop_and_close()
-
-
 class MainWindow(QMainWindow):
     """Master GUI window & top-level Host FSM state manager (spec §4.A.2)."""
 
     def __init__(
         self,
+        controller: Optional[HostController] = None,
+        config: Optional[HostConfig] = None,
+        modal_enabled: bool = False,
+        modal_callback: Optional[Callable[[str], bool]] = None,
+        parent: Optional[QWidget] = None,
+        *,
         qcm_reader: Optional[QCMReader] = None,
         aux_reader: Optional[AuxReader] = None,
         zoh_fusion: Optional[ZOHFusionEngine] = None,
         csv_logger: Optional[CSVLogger] = None,
-        modal_enabled: bool = False,
-        modal_callback: Optional[Callable[[str], bool]] = None,
-        parent: Optional[QWidget] = None,
+        **kwargs: Any,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("ECE 490 QCM Resonant Mass Sensing Platform")
 
-        self.qcm_reader = qcm_reader
-        self.aux_reader = aux_reader
-        self.zoh_fusion = zoh_fusion or ZOHFusionEngine(parent=self)
-        self.csv_logger = csv_logger or CSVLogger()
         self.modal_enabled = modal_enabled
         self.modal_callback = modal_callback
         self.last_fault_message: Optional[str] = None
-
-        self.fsm = HostStateMachine(actions=_WindowActions(self))
-        self.current_state: HostState = self.fsm.state
-        self.history_state: Optional[HostState] = self.fsm.history_state
-        self.fsm.add_listener(self._sync_from_transition)
-
-        self.zoh_fusion.qcm_tare_ready.connect(lambda _f, _t: self.fsm.qcm_tare_ready())
-        self.zoh_fusion.aux_zoh_primed.connect(lambda _d: self.fsm.aux_zoh_primed())
-        self.zoh_fusion.s2_join_complete.connect(self.on_join_completed)
+        self._controller: Optional[HostController] = None
 
         central = QWidget(self)
         layout = QVBoxLayout(central)
@@ -123,50 +57,131 @@ class MainWindow(QMainWindow):
         self.diagnostic_view.start_run_requested.connect(self.on_start_run_clicked)
         self.diagnostic_view.fan_pwm_changed.connect(self.on_fan_slider_changed)
 
-    def _sync_from_transition(self, t: Transition) -> None:
-        self.current_state = self.fsm.state
-        self.history_state = self.fsm.history_state
+        if controller is not None and not isinstance(controller, HostController):
+            # Positional argument passed from legacy constructor
+            qcm_reader = controller
+            controller = None
+
+        ctrl = controller or HostController(config or HostConfig(mock=True))
+        if qcm_reader is not None:
+            ctrl.qcm_reader = qcm_reader
+        if aux_reader is not None:
+            ctrl.aux_reader = aux_reader
+        if zoh_fusion is not None:
+            ctrl.engine = zoh_fusion
+        if csv_logger is not None:
+            ctrl.csv_logger = csv_logger
+
+        self.set_controller(ctrl)
+
+    # ======================================================= controller wiring
+    @property
+    def controller(self) -> HostController:
+        assert self._controller is not None
+        return self._controller
+
+    def set_controller(self, controller: HostController) -> None:
+        if self._controller is not None:
+            try:
+                self._controller.state_changed.disconnect(self._sync_from_transition)
+                self._controller.s2_progress.disconnect(self.diagnostic_view.status_indicator.set_s2_locks)
+                self._controller.fused_row_ready.disconnect(self.update_plots)
+                self._controller.fault_raised.disconnect(self._present_fault_modal)
+                self._controller.fault_cleared.disconnect(self._reset_ui_on_disconnect)
+            except (TypeError, RuntimeError):
+                pass
+
+        self._controller = controller
+        self._controller.state_changed.connect(self._sync_from_transition)
+        self._controller.s2_progress.connect(self.diagnostic_view.status_indicator.set_s2_locks)
+        self._controller.fused_row_ready.connect(self.update_plots)
+        self._controller.fault_raised.connect(self._present_fault_modal)
+        self._controller.fault_cleared.connect(self._reset_ui_on_disconnect)
+
         self.diagnostic_view.status_indicator.set_state(self.current_state)
-        if self.current_state is HostState.S2_TARE_AND_PRIME:
+
+    # Backward-compatible properties mapping directly to the controller:
+    @property
+    def fsm(self) -> HostStateMachine:
+        return self.controller.fsm
+
+    @property
+    def current_state(self) -> HostState:
+        return self.controller.state
+
+    @property
+    def history_state(self) -> Optional[HostState]:
+        return self.controller.fsm.history_state
+
+    @property
+    def zoh_fusion(self) -> ZOHFusionEngine:
+        return self.controller.engine
+
+    @zoh_fusion.setter
+    def zoh_fusion(self, engine: ZOHFusionEngine) -> None:
+        self.controller.engine = engine
+
+    @property
+    def csv_logger(self) -> CSVLogger:
+        return self.controller.csv_logger
+
+    @csv_logger.setter
+    def csv_logger(self, logger: CSVLogger) -> None:
+        self.controller.csv_logger = logger
+
+    @property
+    def qcm_reader(self) -> Optional[QCMReader]:
+        return self.controller.qcm_reader
+
+    @qcm_reader.setter
+    def qcm_reader(self, reader: Optional[QCMReader]) -> None:
+        self.controller.qcm_reader = reader
+
+    @property
+    def aux_reader(self) -> Optional[AuxReader]:
+        return self.controller.aux_reader
+
+    @aux_reader.setter
+    def aux_reader(self, reader: Optional[AuxReader]) -> None:
+        self.controller.aux_reader = reader
+
+    def _sync_from_transition(self, t: Transition) -> None:
+        self.diagnostic_view.status_indicator.set_state(t.target)
+        if t.target is HostState.S2_TARE_AND_PRIME:
             self.diagnostic_view.status_indicator.set_s2_locks(
                 self.fsm.in_s2_a2, self.fsm.in_s2_b2
             )
 
     # ============================================== Spec §4.A.2 FSM handlers
-    @pyqtSlot()
-    def on_ports_connected(self) -> None:
-        """Transition ``S0 -> S1: IDLE / STANDBY``."""
-        self.fsm.boot()
+    @pyqtSlot(result=bool)
+    def on_ports_connected(self) -> bool:
+        """Transition ``S0 -> S1: IDLE / STANDBY`` via controller."""
+        return self.controller.connect_ports()
 
-    @pyqtSlot()
-    def on_start_run_clicked(self) -> None:
-        """Transition ``S1 -> S2: TARE_AND_PRIME``; purge buffers, open CSV, arm tare."""
-        self.fsm.start_run()
+    @pyqtSlot(result=bool)
+    def on_start_run_clicked(self) -> bool:
+        """Transition ``S1 -> S2: TARE_AND_PRIME`` via controller."""
+        return self.controller.start_run()
 
-    @pyqtSlot(int, float)
-    def on_join_completed(self, f0_hz: int, t0_c: float) -> None:
+    @pyqtSlot(int, float, result=bool)
+    def on_join_completed(self, f0_hz: int, t0_c: float) -> bool:
         """Transition ``S2 -> S3: ACTIVE_STREAMING & ZOH_FUSION``."""
-        if self.fsm.state is HostState.S2_TARE_AND_PRIME:
-            if not self.fsm.in_s2_a2:
-                self.fsm.qcm_tare_ready()
-            if not self.fsm.in_s2_b2:
-                self.fsm.aux_zoh_primed()
-            self.fsm.join_completed(f0_hz, t0_c)
+        return self.fsm.join_completed(f0_hz, t0_c)
 
-    @pyqtSlot(int)
-    def on_fan_slider_changed(self, duty: int) -> None:
+    @pyqtSlot(int, result=bool)
+    def on_fan_slider_changed(self, duty: int) -> bool:
         """Validate ``0 <= duty <= 100`` in ``HS_CONNECTED``, enter ``S5`` and return via ``H``."""
-        self.fsm.fan_pwm_changed(duty)
+        return self.controller.set_fan_pwm(duty)
 
     @pyqtSlot(str)
     def on_fault_triggered(self, error_msg: str) -> None:
         """Group Preemptive Exit ``HS_CONNECTED -> S4: FAULT``."""
-        self.fsm.fault(error_msg)
+        self.controller.on_fault_triggered(error_msg)
 
-    @pyqtSlot()
-    def on_fault_modal_confirmed(self) -> None:
+    @pyqtSlot(result=bool)
+    def on_fault_modal_confirmed(self) -> bool:
         """Transition ``S4: FAULT -> S0: DISCONNECTED`` upon modal confirmation."""
-        self.fsm.fault_confirmed()
+        return self.controller.confirm_fault()
 
     @pyqtSlot(dict)
     def update_plots(self, fused_row: dict) -> None:
@@ -191,6 +206,5 @@ class MainWindow(QMainWindow):
         self.diagnostic_view.status_indicator.set_state(HostState.S0_DISCONNECTED)
 
     def closeEvent(self, event: Optional[QCloseEvent]) -> None:  # noqa: N802
-        self.fsm.shutdown()
+        self.controller.shutdown()
         super().closeEvent(event)
-

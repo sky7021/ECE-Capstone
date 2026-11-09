@@ -284,15 +284,4 @@ def test_listener_exceptions_do_not_break_fsm(fsm):
     assert fsm.boot() and fsm.state is S1 and len(seen) == 1
 
 
-def load_tests(loader, tests, pattern):
-    from software.tests._pytest_shim import build_unittest_suite
-
-    return build_unittest_suite(sys.modules[__name__])
-
-
-if __name__ == "__main__":
-    from software.tests._pytest_shim import run_module
-
-    sys.exit(run_module(sys.modules[__name__]))
-
 
