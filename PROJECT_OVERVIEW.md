@@ -64,7 +64,6 @@ The host software architecture is structured across three decoupled architectura
 │   ├── gui/                                # PyQt6 desktop dashboard and pyqtgraph widgets
 │   │   ├── __init__.py                     # GUI package exports
 │   │   ├── app.py                          # GUI application entry point and signal wiring
-│   │   ├── base.py                         # Architectural interface definition stub
 │   │   ├── main_window.py                  # Primary dashboard window, layout, and fault modals
 │   │   ├── views/                          # Dashboard sub-views
 │   │   │   ├── __init__.py
@@ -72,7 +71,6 @@ The host software architecture is structured across three decoupled architectura
 │   │   │   └── time_series_view.py         # 60 FPS multi-plot pyqtgraph real-time charts
 │   │   └── widgets/                        # Specialized visual components
 │   │       ├── __init__.py
-│   │       ├── dynamic_ribbon.py           # Sliding-window mean and standard deviation envelope
 │   │       └── status_indicator.py         # State badges and orthogonal lock indicators
 │   ├── pipeline/                           # Data processing, quality validation, and calibration math
 │   │   ├── __init__.py                     # Pipeline exports
@@ -96,8 +94,6 @@ The host software architecture is structured across three decoupled architectura
 │       ├── test_pipeline.py                # Full integration test suite for pipeline, workers, and GUI
 │       └── virtual_loopback.py             # Virtual serial port harness (in-process pipe & OS COM pairs)
 ├── capstone_agentic_architecture_specification.md  # Comprehensive system specification document
-├── fpga_esp32_testing.py                   # Standalone serial emulator script for hardware test benches
-├── proposed_setup1.py                      # Proof-of-concept numerical SMPS validation script
 ├── README.md                               # Project documentation, team roles, and quickstart guide
 └── requirements.txt                        # Python dependencies (PyQt6, pyqtgraph, pyserial, etc.)
 ```
@@ -130,8 +126,7 @@ A pure-Python implementation of the host state machine. It contains no GUI or ha
 A Qt-aware controller bridging `HostStateMachine`, reader threads, data fusion, and CSV persistence.
 * [`HostConfig`](software/fsm/host_controller.py#L50): Configuration dataclass specifying port names, baud rate, mock flags, timeout thresholds, and log directory.
 * [`default_reader_factory`](software/fsm/host_controller.py#L65): Instantiates production serial workers (`QCMReader`, `AuxReader`) or synthetic testing mock readers based on `HostConfig.mock`.
-* [`HostController`](software/fsm/host_controller.py#L88): Main `QObject` orchestrator. Exposes public slots (`connect_ports`, `start_run`, `set_fan_pwm`, `on_fault_triggered`, `confirm_fault`, `shutdown`), connects worker signals to data fusion engines, verifies worker lifecycle, and emits control and data signals.
-* [`_ControllerActions`](software/fsm/host_controller.py#L252): Private class implementing the `HostActions` protocol on behalf of `HostController`.
+* [`HostController`](software/fsm/host_controller.py): Main `QObject` orchestrator. Implements `HostActions` directly (`self.fsm = HostStateMachine(actions=self)`). Exposes public slots (`connect_ports`, `start_run`, `set_fan_pwm`, `on_fault_triggered`, `confirm_fault`, `shutdown`), connects worker signals to data fusion engines, verifies worker lifecycle, and emits control and data signals.
 
 #### [headless.py](software/fsm/headless.py)
 CLI runner executing the complete pipeline without GUI dependencies.
@@ -223,14 +218,11 @@ Modules responsible for signal validation, multi-rate data fusion, and empirical
 Desktop dashboard built using PyQt6 and hardware-accelerated pyqtgraph.
 
 #### [app.py](software/gui/app.py)
-* [`parse_arguments`](software/gui/app.py#L27): Parses GUI execution flags (`--mock`, `--qcm-port`, `--aux-port`, `--baud`, `--log-dir`).
-* [`ApplicationController`](software/gui/app.py#L42): Top-level GUI orchestrator. Initializes reader threads, configures signal wiring between readers, ZOH fusion, CSV logger, and `MainWindow`, and manages application lifecycle.
-* [`configure_signal_handling`](software/gui/app.py#L125): Hooks OS signals to clean application shutdown.
-* [`main`](software/gui/app.py#L144): Entry point constructing `QApplication`, `MainWindow`, and `ApplicationController`.
+* [`parse_arguments`](software/gui/app.py): Parses GUI execution flags (`--mock`, `--qcm-port`, `--aux-port`, `--baud`, `--log-dir`).
+* [`main`](software/gui/app.py): Entry point constructing `QApplication`, `HostController`, and `MainWindow`.
 
 #### [main_window.py](software/gui/main_window.py)
-* [`_WindowActions`](software/gui/main_window.py#L23): Implements `HostActions` for standalone GUI execution without `HostController`.
-* [`MainWindow`](software/gui/main_window.py#L82): Master dashboard window.
+* [`MainWindow`](software/gui/main_window.py): Master dashboard window.
   * Embeds [DiagnosticView](software/gui/views/diagnostic_view.py#L20) and [TimeSeriesView](software/gui/views/time_series_view.py#L24).
   * State Synchronization: Listens to FSM transitions via `_sync_from_transition` to update state badges and lock indicators.
   * Fault Handling: Presents blocking modal dialogs (`QMessageBox.critical`) when `S4: FAULT` is triggered, auto-confirming return to `S0: DISCONNECTED`.
@@ -248,9 +240,6 @@ Desktop dashboard built using PyQt6 and hardware-accelerated pyqtgraph.
 
 #### [widgets/status_indicator.py](software/gui/widgets/status_indicator.py)
 * [`StatusIndicator`](software/gui/widgets/status_indicator.py#L12): Status indicator widget displaying active FSM state, S2 orthogonal region lock status (`S2.A2` and `S2.B2`), and ZOH cache freshness flags.
-
-#### [widgets/dynamic_ribbon.py](software/gui/widgets/dynamic_ribbon.py)
-* [`DynamicRibbon`](software/gui/widgets/dynamic_ribbon.py#L11): Rolling statistical calculator tracking sliding-window mean and ±1σ confidence envelopes for noisy mass rate signals.
 
 ---
 
@@ -283,8 +272,8 @@ Framework providing hardware-free verification and loopback emulation.
 ### 4.1. Detailed Flow: Boot & Initialization (`S0 -> S1`)
 1. User or CLI invokes [HostController.connect_ports()](software/fsm/host_controller.py#L133).
 2. `HostController` invokes `HostStateMachine.boot()`.
-3. `HostStateMachine` evaluates guard `HostActions.ports_available()`, implemented in `_ControllerActions.ports_available()`.
-4. `HostStateMachine` executes action `HostActions.open_hardware()`, implemented in `_ControllerActions.open_hardware()`:
+3. `HostStateMachine` evaluates guard `HostActions.ports_available()`, implemented in `HostController.ports_available()`.
+4. `HostStateMachine` executes action `HostActions.open_hardware()`, implemented in `HostController.open_hardware()`:
    * Teardown of prior workers (if any) via `_teardown_workers()`.
    * Calls `_reader_factory(config)` to construct `QCMReader` and `AuxReader`.
    * Invokes `open_port()` on both reader instances.
@@ -335,7 +324,7 @@ Framework providing hardware-free verification and loopback emulation.
 2. `MainWindow.on_fan_slider_changed` or `HostController.set_fan_pwm` invokes `HostStateMachine.fan_pwm_changed(duty)`.
 3. FSM validates `0 <= duty <= 100` and records current state into `_history`.
 4. FSM transitions to `S5: PWM FAN` and executes `HostActions.transmit_pwm(duty)`.
-5. `_ControllerActions.transmit_pwm` calls `AuxReader.send_pwm_command(duty)`.
+5. `HostController.transmit_pwm` calls `AuxReader.send_pwm_command(duty)`.
 6. `AuxReader` puts `SET_PWM:<duty>\n` into thread-safe `_tx_queue` without altering input buffers.
 7. Background worker thread drains queue and executes `ser.write()` in non-blocking loop.
 8. FSM automatically transitions from `S5` back to the saved `_history` state (`S1`, `S2`, or `S3`).
@@ -348,7 +337,7 @@ Framework providing hardware-free verification and loopback emulation.
    * `HostController.on_fault_triggered(msg)` invokes `HostStateMachine.fault(msg)`.
 3. Group Preemptive Exit:
    * FSM preempts active state and calls `HostActions.park_hardware(reason)`.
-   * `_ControllerActions.park_hardware` invalidates `ZOHFusionEngine` cache, flushes and closes active CSV file, stops reader threads, and closes serial ports.
+   * `HostController.park_hardware` invalidates `ZOHFusionEngine` cache, flushes and closes active CSV file, stops reader threads, and closes serial ports.
    * FSM enters `S4: FAULT`.
    * FSM calls `HostActions.show_fault(reason)`.
 4. User Modal Confirmation:

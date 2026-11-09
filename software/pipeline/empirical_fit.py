@@ -155,7 +155,7 @@ def align_and_solve_scans(
     use_mass_dose:
         If ``True``, solves against ``D_SMPS = integral Q(tau)*C(tau) d(tau)`` (ug).
         If ``False`` (default), solves against concentration-time dose
-        ``C_SMPS * (t_end - t_start)`` (ug*s/m^3), matching ``proposed_setup1.py``.
+        ``C_SMPS * (t_end - t_start)`` (ug*s/m^3).
     """
     t = np.asarray(qcm_timestamps_s, dtype=float)
     f = np.asarray(qcm_freq_hz, dtype=float)

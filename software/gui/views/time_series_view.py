@@ -13,8 +13,6 @@ from typing import Any, Deque, Optional
 
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
-from software.gui.widgets.dynamic_ribbon import DynamicRibbon
-
 try:
     import pyqtgraph as pg  # type: ignore[import-untyped]
 except ModuleNotFoundError:  # pragma: no cover - headless fallback when pyqtgraph is absent
@@ -33,7 +31,6 @@ class TimeSeriesView(QWidget):
         self.dm_dt_buf: Deque[float] = deque(maxlen=max_points)
         self.t_qcm_buf: Deque[float] = deque(maxlen=max_points)
         self.t_sht_buf: Deque[float] = deque(maxlen=max_points)
-        self.dm_dt_ribbon = DynamicRibbon(window=10, max_points=max_points)
 
         layout = QVBoxLayout(self)
         self.plots: list[Any] = []
@@ -70,7 +67,6 @@ class TimeSeriesView(QWidget):
         self.dm_dt_buf.clear()
         self.t_qcm_buf.clear()
         self.t_sht_buf.clear()
-        self.dm_dt_ribbon.clear()
 
     def append_fused_row(self, row: dict) -> None:
         t = float(row["pc_timestamp_s"])
@@ -80,7 +76,6 @@ class TimeSeriesView(QWidget):
         self.dm_dt_buf.append(float(row["dm_dt_ng_s"]))
         self.t_qcm_buf.append(float(row["qcm_temp_c"]))
         self.t_sht_buf.append(float(row["sht_temp_c"]))
-        self.dm_dt_ribbon.append(t, float(row["dm_dt_ng_s"]))
 
         if self._curves:
             xs = list(self.t_buf)

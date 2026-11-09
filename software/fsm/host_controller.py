@@ -9,17 +9,17 @@ headless runner talks to. It owns:
 * :class:`~software.pipeline.zoh_fusion.ZOHFusionEngine` - S2 latch / S3 fusion
 * :class:`~software.pipeline.csv_logger.CSVLogger` - session storage
 
-Mapping to the spec's GUI handlers (``main_window.py`` should simply delegate):
+Mapping to the spec's GUI handlers (``main_window.py`` simply delegates):
 
 ============================================  ===============================
 Spec handler                                  Controller slot
 ============================================  ===============================
-``ApplicationController.init_workers``        :meth:`connect_ports`
+``connect_ports``                             :meth:`connect_ports`
 ``MainWindow.on_start_run_clicked``           :meth:`start_run`
 ``MainWindow.on_fan_slider_changed``          :meth:`set_fan_pwm`
 ``MainWindow.on_fault_triggered``             :meth:`on_fault_triggered`
 ``MainWindow.on_fault_modal_confirmed``       :meth:`confirm_fault`
-``ApplicationController.shutdown``            :meth:`shutdown`
+``shutdown``                                  :meth:`shutdown`
 ============================================  ===============================
 
 All slots must be called from the GUI (main) thread; reader signals arrive
@@ -29,11 +29,13 @@ there through queued connections.
 from __future__ import annotations
 
 import logging
+import signal
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QCoreApplication, QObject, QTimer, pyqtSignal, pyqtSlot
 from statemachine.exceptions import TransitionNotAllowed
 
 from software.fsm.host_fsm import HostState, HostStateMachine
@@ -53,7 +55,7 @@ class HostConfig:
     qcm_port: Optional[str] = None
     aux_port: Optional[str] = None
     baud: int = DEFAULT_BAUD
-    log_dir: str = DEFAULT_LOG_DIR
+    log_dir: Path | str = DEFAULT_LOG_DIR
     qcm_timeout_s: float = QCM_TIMEOUT_S
     flow_timeout_s: float = FLOW_TIMEOUT_S
     sht_timeout_s: float = SHT_TIMEOUT_S
@@ -86,20 +88,33 @@ def default_reader_factory(config: HostConfig) -> tuple[QCMReader, AuxReader]:
     )
 
 
+def configure_signal_handling(app: QCoreApplication, controller: HostController) -> QTimer:
+    """Trap ``SIGINT`` and ``SIGTERM`` to invoke ``controller.shutdown()`` and quit ``app``."""
+
+    def _handle_sig(_signum: int, _frame: Any) -> None:
+        controller.shutdown()
+        app.quit()
+
+    signal.signal(signal.SIGINT, _handle_sig)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_sig)
+
+    timer = QTimer()
+    timer.timeout.connect(lambda: None)
+    timer.start(200)
+    return timer
+
+
 class HostController(QObject):
     # --- control-plane notifications -------------------------------------
-    state_changed = pyqtSignal(object)  # Transition (use .target for the new HostState)
+    state_changed = pyqtSignal(object)  # HostState
     s2_progress = pyqtSignal(bool, bool)  # (in_s2_a2, in_s2_b2) for lock badges
     connection_failed = pyqtSignal(str)
     session_started = pyqtSignal(str)  # CSV path
-    streaming_started = pyqtSignal(int, float)  # frozen f0 (Hz), T0 (C)
     fault_raised = pyqtSignal(str)  # GUI: show modal, then call confirm_fault()
     fault_cleared = pyqtSignal()
     # --- data-plane passthrough ------------------------------------------
-    qcm_packet = pyqtSignal(float, int, float)  # raw QCM (any connected state)
-    aux_packet = pyqtSignal(float, dict)  # raw AUX (any connected state)
     fused_row_ready = pyqtSignal(dict)  # S3 fused rows (plots)
-    pwm_command_sent = pyqtSignal(int)
 
     def __init__(
         self,
@@ -113,6 +128,7 @@ class HostController(QObject):
         self.qcm_reader: Optional[QCMReader] = None
         self.aux_reader: Optional[AuxReader] = None
         self.last_error: Optional[str] = None
+        self._last_emitted_state: HostState = HostState.S0_DISCONNECTED
 
         self.engine = ZOHFusionEngine(
             flow_timeout_s=self.config.flow_timeout_s,
@@ -120,7 +136,7 @@ class HostController(QObject):
             parent=self,
         )
         self.csv_logger = CSVLogger(self.config.log_dir)
-        self.fsm = HostStateMachine(actions=_ControllerActions(self))
+        self.fsm = HostStateMachine(actions=self)
         self.fsm.add_listener(self)
         self._bind_engine()
 
@@ -129,61 +145,55 @@ class HostController(QObject):
     def state(self) -> HostState:
         return self.fsm.state
 
+    # ======================================================== dispatch helper
+    def _dispatch(
+        self,
+        event_fn: Callable[..., Any],
+        *args: Any,
+        on_error: Optional[Callable[[TransitionNotAllowed], None]] = None,
+    ) -> bool:
+        try:
+            event_fn(*args)
+            return True
+        except TransitionNotAllowed as exc:
+            if on_error is not None:
+                on_error(exc)
+            return False
+
     # ========================================================== public slots
     @pyqtSlot(result=bool)
     def connect_ports(self) -> bool:
         """``S0 -> S1``: guard ports, open them and spawn the reader QThreads."""
         self.last_error = None
-        try:
-            self.fsm.boot()
-            return True
-        except TransitionNotAllowed as exc:
-            msg = self.last_error or str(exc)
-            self.connection_failed.emit(msg)
-            return False
+        return self._dispatch(
+            self.fsm.boot,
+            on_error=lambda exc: self.connection_failed.emit(self.last_error or str(exc)),
+        )
 
     @pyqtSlot(result=bool)
     def start_run(self) -> bool:
         """``S1 -> S2``: purge buffers, open session CSV, arm S2 priming."""
-        try:
-            self.fsm.start_run()
-            return True
-        except TransitionNotAllowed:
-            return False
+        return self._dispatch(self.fsm.start_run)
 
     @pyqtSlot(int, result=bool)
     def set_fan_pwm(self, duty: int) -> bool:
         """``HS_CONNECTED -> S5 -> H``: transmit ``SET_PWM:<duty>``."""
-        try:
-            self.fsm.fan_pwm_changed(duty)
-            return True
-        except TransitionNotAllowed:
-            return False
+        return self._dispatch(self.fsm.fan_pwm_changed, duty)
 
     @pyqtSlot(str)
     def on_fault_triggered(self, error_msg: str) -> None:
         """``HS_CONNECTED -> S4`` group preemptive exit."""
-        try:
-            self.fsm.fault(error_msg)
-        except TransitionNotAllowed:
-            pass
+        self._dispatch(self.fsm.fault, error_msg)
 
     @pyqtSlot(result=bool)
     def confirm_fault(self) -> bool:
         """``S4 -> S0`` after the user acknowledges the fault modal."""
-        try:
-            self.fsm.fault_confirmed()
-            return True
-        except TransitionNotAllowed:
-            return False
+        return self._dispatch(self.fsm.fault_confirmed)
 
     @pyqtSlot()
     def shutdown(self) -> None:
         """Direct termination (app exit / SIGINT / SIGTERM)."""
-        try:
-            self.fsm.shutdown()
-        except TransitionNotAllowed:
-            pass
+        self._dispatch(self.fsm.shutdown)
 
     # ======================================================== signal wiring
     def _bind_engine(self) -> None:
@@ -222,39 +232,27 @@ class HostController(QObject):
     def _on_qcm_packet(self, ts: float, freq_hz: int, temp_c: float) -> None:
         if not self._is_current_worker(self.sender()):
             return
-        self.qcm_packet.emit(ts, freq_hz, temp_c)
         self.engine.ingest_qcm(ts, freq_hz, temp_c)
 
     @pyqtSlot(float, dict)
     def _on_aux_packet(self, ts: float, aux: dict) -> None:
         if not self._is_current_worker(self.sender()):
             return
-        self.aux_packet.emit(ts, aux)
         self.engine.ingest_aux(ts, aux)
 
     @pyqtSlot(str)
     def _on_worker_fault(self, msg: str) -> None:
-        if not self._is_current_worker(self.sender()):
-            return
-        try:
-            self.fsm.fault(msg)
-        except TransitionNotAllowed:
-            pass
+        if self._is_current_worker(self.sender()):
+            self.on_fault_triggered(msg)
 
     # ---------------------------------------------------------- engine slots
     @pyqtSlot(int, float)
     def _on_qcm_tare_ready(self, f_hz: int, t_c: float) -> None:
-        try:
-            self.fsm.qcm_tare_ready()
-        except TransitionNotAllowed:
-            pass
+        self._dispatch(self.fsm.qcm_tare_ready)
 
     @pyqtSlot(dict)
     def _on_aux_zoh_primed(self, aux: dict) -> None:
-        try:
-            self.fsm.aux_zoh_primed()
-        except TransitionNotAllowed:
-            pass
+        self._dispatch(self.fsm.aux_zoh_primed)
 
     @pyqtSlot(int, float)
     def _on_join_complete(self, f0_hz: int, t0_c: float) -> None:
@@ -267,7 +265,10 @@ class HostController(QObject):
     # -------------------------------------------------------- FSM listener
     def after_transition(self, event: Any, source: Any, target: Any, **kwargs: Any) -> None:
         self.s2_progress.emit(self.fsm.in_s2_a2, self.fsm.in_s2_b2)
-        self.state_changed.emit(self.fsm.state)
+        state = self.fsm.state
+        if state is not self._last_emitted_state:
+            self._last_emitted_state = state
+            self.state_changed.emit(state)
 
     # ------------------------------------------------------ action helpers
     def _teardown_workers(self) -> None:
@@ -279,83 +280,70 @@ class HostController(QObject):
             w.stop_and_close()
             w.deleteLater()
 
-
-class _ControllerActions:
-    """:class:`~software.fsm.host_fsm.HostActions` implementation backed by the controller."""
-
-    def __init__(self, c: HostController) -> None:
-        self._c = c
-
-    # --- guards -----------------------------------------------------------
+    # --- HostActions guards -----------------------------------------------
     def ports_available(self) -> bool:
-        cfg = self._c.config
+        cfg = self.config
         if cfg.mock:
             return True
         if not (cfg.qcm_port and cfg.aux_port):
-            self._c.last_error = "both --qcm-port and --aux-port are required (or use --mock)"
+            self.last_error = "both --qcm-port and --aux-port are required (or use --mock)"
             return False
         return True
 
     def ports_healthy(self) -> bool:
-        q, a = self._c.qcm_reader, self._c.aux_reader
+        q, a = self.qcm_reader, self.aux_reader
         return q is not None and a is not None and q.is_healthy and a.is_healthy
 
-    # --- actions ----------------------------------------------------------
+    # --- HostActions methods ----------------------------------------------
     def open_hardware(self) -> bool:
-        c = self._c
-        c._teardown_workers()  # defensive: never leak a previous session's threads
-        qcm, aux = c._reader_factory(c.config)
+        self._teardown_workers()  # defensive: never leak a previous session's threads
+        qcm, aux = self._reader_factory(self.config)
         if not qcm.open_port() or not aux.open_port():
-            c.last_error = qcm.last_error or aux.last_error or "failed to open serial ports"
+            self.last_error = qcm.last_error or aux.last_error or "failed to open serial ports"
             for w in (qcm, aux):
                 w.stop_and_close()
                 w.deleteLater()
             return False
-        c.qcm_reader, c.aux_reader = qcm, aux
-        c._bind_workers(qcm, aux)
+        self.qcm_reader, self.aux_reader = qcm, aux
+        self._bind_workers(qcm, aux)
         qcm.start()
         aux.start()
         return True
 
     def begin_session(self) -> None:
-        c = self._c
-        assert c.qcm_reader is not None and c.aux_reader is not None
+        assert self.qcm_reader is not None and self.aux_reader is not None
         armed_at = time.monotonic()
-        c.qcm_reader.purge_input_buffer()  # guardrail 5: only on S1 -> S2
-        c.aux_reader.purge_input_buffer()
-        path = c.csv_logger.open_session_csv()
-        c.engine.reset_for_tare(armed_at)
-        c.session_started.emit(str(path))
+        self.qcm_reader.purge_input_buffer()  # guardrail 5: only on S1 -> S2
+        self.aux_reader.purge_input_buffer()
+        path = self.csv_logger.open_session_csv()
+        self.engine.reset_for_tare(armed_at)
+        self.session_started.emit(str(path))
 
     def begin_streaming(self, f0_hz: int, t0_c: float) -> None:
         # The engine already froze the baseline and entered STREAMING; CSV
         # logging is driven by engine.fused_row_ready.
-        self._c.streaming_started.emit(f0_hz, t0_c)
+        pass
 
     def transmit_pwm(self, duty: int) -> None:
-        c = self._c
-        if c.aux_reader is None:
+        if self.aux_reader is None:
             raise RuntimeError("AUX reader not running")
-        c.aux_reader.send_pwm_command(duty)
-        c.pwm_command_sent.emit(duty)
+        self.aux_reader.send_pwm_command(duty)
 
     def park_hardware(self, reason: str) -> None:
         self._release_all()
 
     def show_fault(self, reason: str) -> None:
-        self._c.fault_raised.emit(reason)
+        self.fault_raised.emit(reason)
 
     def clear_fault(self) -> None:
-        self._c.fault_cleared.emit()
+        self.fault_cleared.emit()
 
     def terminate(self) -> None:
         self._release_all()
 
     def _release_all(self) -> None:
-        c = self._c
-        c.engine.invalidate()  # invalidate ZOH cache, halt derivative math
+        self.engine.invalidate()  # invalidate ZOH cache, halt derivative math
         try:
-            c.csv_logger.flush_and_close()
+            self.csv_logger.flush_and_close()
         finally:
-            c._teardown_workers()  # stop QThreads, close ports
-
+            self._teardown_workers()  # stop QThreads, close ports

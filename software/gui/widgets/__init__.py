@@ -1,2 +1,2 @@
-"""Diagnostic status badges and confidence ribbon widgets."""
+"""Diagnostic status badges and indicators."""
 

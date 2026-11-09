@@ -127,7 +127,7 @@ The `HostStateMachine` subclasses `statemachine.StateChart` with `allow_event_wi
      * Guards: `ports_available() -> bool`, `ports_healthy() -> bool`.
      * Lifecycle Actions: `open_hardware() -> bool`, `begin_session() -> None`, `begin_streaming(f0_hz: int, t0_c: float) -> None`, `transmit_pwm(duty: int) -> None`, `park_hardware(reason: str) -> None`, `show_fault(reason: str) -> None`, `clear_fault() -> None`, `terminate() -> None`.
    * `NullActions`: Default no-op implementation with permissive guards for dry runs and headless unit testing.
-   * `_ControllerActions`: Implementation provided by `HostController` in [`software/fsm/host_controller.py`](file:///software/fsm/host_controller.py), bridging the FSM with Qt serial workers, CSV logging, and GUI signals.
+   * `HostController`: Implements `HostActions` directly in [`software/fsm/host_controller.py`](file:///software/fsm/host_controller.py), bridging the FSM with Qt serial workers, CSV logging, and GUI signals.
 
 4. **Exception Handling & RTC Semantics:**
    * Calling a transition when invalid raises `statemachine.exceptions.TransitionNotAllowed`, cleanly caught by `HostController` public slots.
@@ -181,8 +181,9 @@ ece490-qcm-platform/
 ├── codebase_learning_guide.md
 ├── capstone_agentic_architecture_specification.md  # System Architecture & Agentic Development Specification
 ├── requirements.txt                    # PyQt6, pyqtgraph, pyserial, numpy, pandas, scipy, pytest, python-statemachine
-├── fpga_esp32_testing.py               # Hardware prototype test script
-├── proposed_setup1.py                  # Hardware prototype setup script
+│
+├── data/                               # Session CSV storage directory (anchored at code/data/sessions)
+│   └── sessions/
 │
 ├── software/                           # Host PC Master Orchestrator & Analytics Stack
 │   ├── __init__.py
@@ -194,8 +195,7 @@ ece490-qcm-platform/
 │   ├── gui/                            # Presentation Layer & GUI Widgets
 │   │   ├── .gitkeep
 │   │   ├── __init__.py
-│   │   ├── base.py                     # Main event loop driver stub
-│   │   ├── app.py                      # Application entry point, CLI parser & ApplicationController
+│   │   ├── app.py                      # Application entry point, CLI parser, signal handling & main window launch
 │   │   ├── main_window.py              # Master GUI window, views coordination, fault modal handling
 │   │   ├── views/
 │   │   │   ├── __init__.py
@@ -203,8 +203,7 @@ ece490-qcm-platform/
 │   │   │   └── diagnostic_view.py      # Telemetry readouts, status badges, Start Run, Fan PWM slider
 │   │   └── widgets/
 │   │       ├── __init__.py
-│   │       ├── status_indicator.py     # LED state badges (S0-S5, S2.A2/S2.B2 locks, ZOH health)
-│   │       └── dynamic_ribbon.py       # Mean trajectory curve with +/-1 sigma confidence envelope
+│   │       └── status_indicator.py     # LED state badges (S0-S5, S2.A2/S2.B2 locks, ZOH health)
 │   │
 │   ├── readers/                        # Asynchronous UART-over-USB Ingestion Workers
 │   │   ├── .gitkeep
@@ -269,31 +268,27 @@ ece490-qcm-platform/
    * `class HostConfig` (Dataclass): Configuration parameters including `mock: bool`, `qcm_port: Optional[str]`, `aux_port: Optional[str]`, `baud: int`, `log_dir: str`, `flow_timeout_s: float`, `sht_timeout_s: float`, `qcm_timeout_s: float`.
 
    * `class HostController(QObject)`: Central orchestrator unifying control plane, data plane, serial workers, and CSV logging:
-     * Control-Plane Signals: `state_changed(object)`, `s2_progress(bool, bool)`, `connection_failed(str)`, `session_started(str)`, `streaming_started(int, float)`, `fault_raised(str)`, `fault_cleared()`.
-     * Data-Plane Signals: `qcm_packet(float, int, float)`, `aux_packet(float, dict)`, `fused_row_ready(dict)`, `pwm_command_sent(int)`.
-     * Public Qt Slots: `connect_ports() -> bool`, `start_run() -> bool`, `set_fan_pwm(duty: int) -> bool`, `on_fault_triggered(error_msg: str) -> None`, `confirm_fault() -> bool`, `shutdown() -> None`. Each slot catches `statemachine.exceptions.TransitionNotAllowed` to prevent unhandled FSM rejections from propagating.
+     * Control-Plane Signals: `state_changed(object)`, `s2_progress(bool, bool)`, `connection_failed(str)`, `session_started(str)`, `fault_raised(str)`, `fault_cleared()`.
+     * Data-Plane Signals: `fused_row_ready(dict)`.
+     * Public Qt Slots: `connect_ports() -> bool`, `start_run() -> bool`, `set_fan_pwm(duty: int) -> bool`, `on_fault_triggered(error_msg: str) -> None`, `confirm_fault() -> bool`, `shutdown() -> None`. Each slot uses `_dispatch` to safely handle `statemachine.exceptions.TransitionNotAllowed`.
      * Worker Lifecycle & Filtering: `_bind_workers()` wires worker signals, `_teardown_workers()` safely joins threads and closes ports, and `_is_current_worker()` filters out late signals from previously torn-down workers.
-     * `_ControllerActions(HostActions)`: Concrete implementation of `HostActions` backed by the controller, handling port opening, buffer purging, CSV initialization, PWM transmission, and hardware parking.
+     * `HostActions` Implementation: `HostController` implements `HostActions` directly (`self.fsm = HostStateMachine(actions=self)`), handling port opening, buffer purging, CSV initialization, PWM transmission, and hardware parking without an intermediate proxy class.
 
 3. **`software/fsm/headless.py`**
 
    * `parse_arguments() -> argparse.Namespace`: Parses CLI options (`--mock`, `--qcm-port`, `--aux-port`, `--baud`, `--log-dir`, `--duration`, `--pwm <DUTY@SECONDS>`, `-v/--verbose`).
-   * `configure_signal_handling(app: QCoreApplication, controller: HostController) -> QTimer`: Attaches POSIX and Windows signal handlers (`SIGINT`, `SIGTERM`) to trigger `controller.shutdown()`.
+   * Imports `configure_signal_handling` directly from `software.fsm.host_controller`.
    * `main(argv) -> int`: Headless execution loop running on `QCoreApplication` without GUI overhead; coordinates full run lifecycle, schedules Fan PWM steps, auto-acknowledges faults, and returns deterministic status exit codes.
 
 #### B. `/software/gui/` — Presentation Layer & GUI Widgets
 
-1. **`software/gui/base.py`**
+1. **`software/gui/app.py`**
 
-   * Lightweight module providing driver stubs and main loop entry points.
+   * `parse_arguments() -> argparse.Namespace`: Parses GUI arguments (`--mock`, `--qcm-port`, `--aux-port`, `--baud`, `--log-dir` defaulting to `DEFAULT_LOG_DIR` anchored at `code/data/sessions`).
+   * Imports `configure_signal_handling` directly from `software.fsm.host_controller`.
+   * `main(argv) -> int`: Application entry point instantiating `HostController` and `MainWindow`, configuring OS signal handling, connecting ports, and running the Qt event loop.
 
-2. **`software/gui/app.py`**
-
-   * `parse_arguments() -> argparse.Namespace`: Parses GUI arguments (`--mock`, `--qcm-port`, `--aux-port`, `--baud`, `--log-dir`).
-   * `configure_signal_handling(app: QCoreApplication, controller: HostController) -> QTimer`: Sets up clean shutdown on `SIGINT` / `SIGTERM`.
-   * `class ApplicationController(QObject)`: Backwards-compatible adapter delegating lifecycle management, worker properties, and signal wiring to unified `HostController` and `MainWindow`.
-
-3. **`software/gui/main_window.py`**
+2. **`software/gui/main_window.py`**
 
    * `class MainWindow(QMainWindow)`:
      * Observes `HostController` transitions via `state_changed` and `s2_progress` signals; receives active `HostState` directly.
@@ -301,7 +296,7 @@ ece490-qcm-platform/
      * Updates 60 FPS pyqtgraph subplots upon `fused_row_ready`.
      * Manages modal `QMessageBox.critical` on fault and acknowledges via `controller.confirm_fault()`.
 
-4. **`software/gui/views/diagnostic_view.py` & `time_series_view.py`**
+3. **`software/gui/views/diagnostic_view.py` & `time_series_view.py`**
 
    * `class DiagnosticView(QWidget)`: Telemetry and actuator panel rendering `StatusIndicator`, "Start Run" button, 0–100% Fan PWM `QSlider`, and digital readouts for D6F flow rate ($\text{L/min}$), SHT21 RH ($\%$), and ZOH age indicators. *(Note: COM ports are configured via CLI / `HostConfig` rather than GUI dropdowns).*
    * `class TimeSeriesView(QWidget)`: Manages 4 synchronized `pyqtgraph.PlotWidget` subplots:
@@ -310,10 +305,9 @@ ece490-qcm-platform/
      3. Sauerbrey Mass Deposition Rate $\frac{dm}{dt}$ ($\text{ng/s}$)
      4. Crystal Holder Temperature $T_{\text{qcm}}(t)$ vs. SHT21 Chamber Temperature $T_{\text{sht}}(t)$ ($^\circ\text{C}$)
 
-5. **`software/gui/widgets/status_indicator.py` & `dynamic_ribbon.py`**
+4. **`software/gui/widgets/status_indicator.py`**
 
    * `class StatusIndicator(QWidget)`: LED state badges (`S0`–`S5`), dual `S2` lock badges (`QCM Tare`, `AUX Prime`), and ZOH cache health indicators.
-   * `class DynamicRibbon`: Computes mean trajectory curve with $\pm 1\sigma$ confidence envelope for real-time drift estimation.
 
 #### C. `/software/readers/` — Asynchronous Serial Ingestion Workers
 
@@ -360,7 +354,7 @@ ece490-qcm-platform/
 
 3. **`software/pipeline/csv_logger.py`**
 
-   * `class CSVLogger`: Opens session CSV (`data/sessions/session_YYYYMMDD_HHMMSS.csv`) on `S1 -> S2`, appends $1\text{ Hz}$ fused rows in `S3`, and safely flushes and closes file handles on `S4: FAULT` or application shutdown.
+   * `class CSVLogger`: Opens session CSV (`session_YYYYMMDD_HHMMSS.csv`) inside `DEFAULT_LOG_DIR` (anchored to `code/data/sessions/` via `Path(__file__).resolve().parents[2] / "data" / "sessions"`) on `S1 -> S2`, appends $1\text{ Hz}$ fused rows in `S3`, and safely flushes and closes file handles on `S4: FAULT` or application shutdown.
 
 4. **`software/pipeline/quality.py`**
 
@@ -393,7 +387,7 @@ ece490-qcm-platform/
 
 5. **`software/tests/test_pipeline.py`**
 
-   * 56 full-stack integration tests covering wire parsing, ZOH latching, Sauerbrey calculations, virtual loopback communication, `ApplicationController`, and `MainWindow` UI updates.
+   * 56 full-stack integration tests covering wire parsing, ZOH latching, Sauerbrey calculations, virtual loopback communication, `HostController`, and `MainWindow` UI updates.
 
 ## 5. Mathematical & Signal Processing Formulations
 
@@ -449,7 +443,7 @@ $$
 
 ### 5. Unified Session CSV Schema (`csv_logger.py`)
 
-Opened upon `S1 -> S2` transition (`data/sessions/session_YYYYMMDD_HHMMSS.csv`) and flushed/closed on `S4: FAULT` or `S0` exit:
+Opened upon `S1 -> S2` transition (`session_YYYYMMDD_HHMMSS.csv` inside `data/sessions/` anchored to `code/data/sessions/`) and flushed/closed on `S4: FAULT` or `S0` exit:
 
 ```
 pc_timestamp_s,qcm_freq_hz,delta_f_hz,df_dt_hz_s,dm_dt_ng_s,qcm_temp_c,flow_lpm,sht_temp_c,sht_rh_pct,pwm_duty,zoh_flow_age_s,zoh_sht_age_s
@@ -517,5 +511,5 @@ When implementing or modifying the `/software` stack, coding agents must execute
    * *Acceptance Test:* Full integration test suite passes (56/56 passing) verifying end-to-end loopback data flow, session CSV logging, and fault propagation across virtual ports.
 
 5. **Step 5 — PyQt6 GUI & Presentation Layer (`software/gui/`):**
-   * Implement `status_indicator.py`, `dynamic_ribbon.py`, `time_series_view.py`, `diagnostic_view.py` (without COM port dropdowns), `main_window.py`, `base.py`, and `app.py`.
+   * Implement `status_indicator.py`, `time_series_view.py`, `diagnostic_view.py` (without COM port dropdowns), `main_window.py`, and `app.py`.
    * *Acceptance Test:* Run full test suite `pytest` (all 93 tests pass). Verify live GUI smoke test with `python -m software.gui.app --mock` (60 FPS plotting, S1-S3 transitions, S5 Fan PWM slider, modal fault popup recovery) and headless smoke test with `python -m software.fsm.headless --mock --duration 5 --pwm 75@2`.

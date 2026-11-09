@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import time
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtGui import QCloseEvent
@@ -13,10 +12,6 @@ from software.fsm.host_controller import HostConfig, HostController
 from software.fsm.host_fsm import HostState, HostStateMachine
 from software.gui.views.diagnostic_view import DiagnosticView
 from software.gui.views.time_series_view import TimeSeriesView
-from software.pipeline.csv_logger import CSVLogger
-from software.pipeline.zoh_fusion import ZOHFusionEngine
-from software.readers.aux_reader import AuxReader
-from software.readers.qcm_reader import QCMReader
 
 __all__ = ["HostState", "MainWindow"]
 
@@ -31,12 +26,6 @@ class MainWindow(QMainWindow):
         modal_enabled: bool = False,
         modal_callback: Optional[Callable[[str], bool]] = None,
         parent: Optional[QWidget] = None,
-        *,
-        qcm_reader: Optional[QCMReader] = None,
-        aux_reader: Optional[AuxReader] = None,
-        zoh_fusion: Optional[ZOHFusionEngine] = None,
-        csv_logger: Optional[CSVLogger] = None,
-        **kwargs: Any,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("ECE 490 QCM Resonant Mass Sensing Platform")
@@ -57,21 +46,7 @@ class MainWindow(QMainWindow):
         self.diagnostic_view.start_run_requested.connect(self.on_start_run_clicked)
         self.diagnostic_view.fan_pwm_changed.connect(self.on_fan_slider_changed)
 
-        if controller is not None and not isinstance(controller, HostController):
-            # Positional argument passed from legacy constructor
-            qcm_reader = controller
-            controller = None
-
         ctrl = controller or HostController(config or HostConfig(mock=True))
-        if qcm_reader is not None:
-            ctrl.qcm_reader = qcm_reader
-        if aux_reader is not None:
-            ctrl.aux_reader = aux_reader
-        if zoh_fusion is not None:
-            ctrl.engine = zoh_fusion
-        if csv_logger is not None:
-            ctrl.csv_logger = csv_logger
-
         self.set_controller(ctrl)
 
     # ======================================================= controller wiring
@@ -100,7 +75,6 @@ class MainWindow(QMainWindow):
 
         self.diagnostic_view.status_indicator.set_state(self.current_state)
 
-    # Backward-compatible properties mapping directly to the controller:
     @property
     def fsm(self) -> HostStateMachine:
         return self.controller.fsm
@@ -113,40 +87,7 @@ class MainWindow(QMainWindow):
     def history_state(self) -> Optional[HostState]:
         return self.controller.fsm.history_state
 
-    @property
-    def zoh_fusion(self) -> ZOHFusionEngine:
-        return self.controller.engine
-
-    @zoh_fusion.setter
-    def zoh_fusion(self, engine: ZOHFusionEngine) -> None:
-        self.controller.engine = engine
-
-    @property
-    def csv_logger(self) -> CSVLogger:
-        return self.controller.csv_logger
-
-    @csv_logger.setter
-    def csv_logger(self, logger: CSVLogger) -> None:
-        self.controller.csv_logger = logger
-
-    @property
-    def qcm_reader(self) -> Optional[QCMReader]:
-        return self.controller.qcm_reader
-
-    @qcm_reader.setter
-    def qcm_reader(self, reader: Optional[QCMReader]) -> None:
-        self.controller.qcm_reader = reader
-
-    @property
-    def aux_reader(self) -> Optional[AuxReader]:
-        return self.controller.aux_reader
-
-    @aux_reader.setter
-    def aux_reader(self, reader: Optional[AuxReader]) -> None:
-        self.controller.aux_reader = reader
-
-    def _sync_from_transition(self, target: Any) -> None:
-        state = target.target if hasattr(target, "target") else target
+    def _sync_from_transition(self, state: HostState) -> None:
         self.diagnostic_view.status_indicator.set_state(state)
         if state is HostState.S2_TARE_AND_PRIME:
             self.diagnostic_view.status_indicator.set_s2_locks(
@@ -155,19 +96,9 @@ class MainWindow(QMainWindow):
 
     # ============================================== Spec §4.A.2 FSM handlers
     @pyqtSlot(result=bool)
-    def on_ports_connected(self) -> bool:
-        """Transition ``S0 -> S1: IDLE / STANDBY`` via controller."""
-        return self.controller.connect_ports()
-
-    @pyqtSlot(result=bool)
     def on_start_run_clicked(self) -> bool:
         """Transition ``S1 -> S2: TARE_AND_PRIME`` via controller."""
         return self.controller.start_run()
-
-    @pyqtSlot(int, float, result=bool)
-    def on_join_completed(self, f0_hz: int, t0_c: float) -> bool:
-        """Transition ``S2 -> S3: ACTIVE_STREAMING & ZOH_FUSION``."""
-        return self.fsm.join_completed(f0_hz, t0_c)
 
     @pyqtSlot(int, result=bool)
     def on_fan_slider_changed(self, duty: int) -> bool:

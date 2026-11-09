@@ -8,7 +8,7 @@ Covers:
   malformed line resilience, and 3.0 s / 6.0 s watchdog faults
 * Step 3: Mock generators, Tier 2 loopback harness & full headless integration
   across ``S0 -> S1 -> S2 -> S3 -> S5 -> S3 -> S4 -> S0``
-* Step 4: ``MainWindow`` and ``ApplicationController`` FSM orchestration
+* Step 4: ``MainWindow`` and ``HostController`` FSM orchestration
 """
 
 from __future__ import annotations
@@ -21,12 +21,11 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import software.tests  # noqa: F401 - activates pytest shim when pytest is not installed
 import pytest
 
 from software.fsm.host_controller import HostConfig, HostController
 from software.fsm.host_fsm import HostState
-from software.gui.app import ApplicationController, parse_arguments
+from software.gui.app import parse_arguments
 from software.gui.main_window import MainWindow
 from software.pipeline.csv_logger import CSV_COLUMNS, CSVLogger
 from software.pipeline.empirical_fit import (
@@ -321,6 +320,12 @@ class TestCSVLogger:
         logger.flush_and_close()
         assert p1 != p2 and p1.exists() and p2.exists()
 
+    def test_default_log_dir_anchored_under_code(self):
+        from software.pipeline.csv_logger import DEFAULT_LOG_DIR
+        assert DEFAULT_LOG_DIR.name == "sessions"
+        assert DEFAULT_LOG_DIR.parent.name == "data"
+        assert (DEFAULT_LOG_DIR.parents[1] / "software").is_dir()
+
 
 class TestEmpiricalFitAndSMPS:
     def test_dose_integral_and_least_squares(self):
@@ -530,48 +535,13 @@ class TestFullStackIntegration:
             assert ctrl.confirm_fault()
             assert ctrl.state is HostState.S0_DISCONNECTED
 
-    def test_gui_application_controller_and_main_window(self, tmp_path, waiter):
-        """Step 4: Verify ApplicationController and MainWindow FSM handlers."""
+    def test_gui_host_controller_and_main_window(self, tmp_path, waiter):
+        """Step 4: Verify HostController and MainWindow FSM handlers."""
         args = parse_arguments(["--mock", "--log-dir", str(tmp_path / "gui_sessions")])
         assert args.mock is True
         cfg = HostConfig(
             mock=True,
             log_dir=args.log_dir,
-            mock_period_s=0.05,
-            qcm_timeout_s=1.5,
-            flow_timeout_s=1.5,
-            sht_timeout_s=3.0,
-        )
-        win = MainWindow(modal_enabled=False)
-        app_ctrl = ApplicationController(config=cfg, main_window=win)
-
-        assert win.current_state is HostState.S0_DISCONNECTED
-        assert app_ctrl.init_workers()
-        assert win.current_state is HostState.S1_IDLE_STANDBY
-
-        win.on_start_run_clicked()
-        assert win.current_state is HostState.S2_TARE_AND_PRIME
-        assert waiter(
-            lambda: win.current_state is HostState.S3_ACTIVE_STREAMING
-            and len(win.time_series_view.t_buf) >= 2,
-            timeout=3.0,
-        )
-
-        win.on_fan_slider_changed(55)
-        assert win.current_state is HostState.S3_ACTIVE_STREAMING
-        assert win.history_state is HostState.S3_ACTIVE_STREAMING
-
-        win.on_fault_triggered("Simulated cable pull")
-        assert win.current_state is HostState.S4_FAULT
-        win.on_fault_modal_confirmed()
-        assert win.current_state is HostState.S0_DISCONNECTED
-        app_ctrl.shutdown()
-
-    def test_gui_unified_host_controller_and_main_window(self, tmp_path, waiter):
-        """Step 4: Verify direct unified HostController + MainWindow architecture."""
-        cfg = HostConfig(
-            mock=True,
-            log_dir=str(tmp_path / "gui_direct_unified"),
             mock_period_s=0.05,
             qcm_timeout_s=1.5,
             flow_timeout_s=1.5,

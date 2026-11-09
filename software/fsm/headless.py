@@ -16,16 +16,19 @@ import argparse
 import logging
 import math
 from pathlib import Path
-import signal
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from PyQt6.QtCore import QCoreApplication, QTimer
 
-from software.fsm.host_controller import HostConfig, HostController
+from software.fsm.host_controller import (
+    HostConfig,
+    HostController,
+    configure_signal_handling,
+)
 from software.pipeline.csv_logger import DEFAULT_LOG_DIR
 from software.readers.serial_worker import DEFAULT_BAUD
 
@@ -36,7 +39,7 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--qcm-port", help="Basys 3 FPGA COM port (Link A)")
     ap.add_argument("--aux-port", help="ESP32 COM port (Link B)")
     ap.add_argument("--baud", type=int, default=DEFAULT_BAUD)
-    ap.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
+    ap.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     ap.add_argument("--duration", type=float, default=0.0, help="seconds to run (0 = until Ctrl+C)")
     ap.add_argument(
         "--pwm",
@@ -57,24 +60,6 @@ def config_from_args(args: argparse.Namespace) -> HostConfig:
         baud=args.baud,
         log_dir=args.log_dir,
     )
-
-
-def configure_signal_handling(app: QCoreApplication, controller: HostController) -> QTimer:
-    """Trap SIGINT/SIGTERM -> ``controller.shutdown()`` and quit the event loop."""
-
-    def _handler(signum, _frame) -> None:
-        controller.shutdown()
-        app.quit()
-
-    signal.signal(signal.SIGINT, _handler)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _handler)
-    # Let the Python interpreter run periodically so signal handlers fire
-    # while Qt's C++ event loop is blocking.
-    timer = QTimer()
-    timer.timeout.connect(lambda: None)
-    timer.start(200)
-    return timer
 
 
 def _fmt(v: float, spec: str) -> str:
@@ -134,4 +119,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -33,7 +33,7 @@ CSV_COLUMNS: tuple[str, ...] = (
     "zoh_sht_age_s",
 )
 
-DEFAULT_LOG_DIR = "data/sessions"
+DEFAULT_LOG_DIR: Path = Path(__file__).resolve().parents[2] / "data" / "sessions"
 
 
 def _fmt(value: object) -> object:
