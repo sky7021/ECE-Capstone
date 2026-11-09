@@ -9,6 +9,7 @@ env/
 *.csv                  # Ignore session data dumps / test run CSVs
 *.parquet
 *.sqlite3
+data/sessions/
 
 # === Vivado / Basys 3 FPGA Artifacts ===
 *.jou
@@ -39,3 +40,4 @@ Project Outputs for */
 Thumbs.db
 .idea/
 .vscode/
+
