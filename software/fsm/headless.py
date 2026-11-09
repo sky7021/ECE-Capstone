@@ -26,7 +26,6 @@ if __package__ in (None, ""):
 from PyQt6.QtCore import QCoreApplication, QTimer
 
 from software.fsm.host_controller import HostConfig, HostController
-from software.fsm.host_fsm import Transition
 from software.pipeline.csv_logger import DEFAULT_LOG_DIR
 from software.readers.serial_worker import DEFAULT_BAUD
 
@@ -92,8 +91,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     controller = HostController(config_from_args(args))
     _keepalive = configure_signal_handling(app, controller)
 
-    def on_transition(t: Transition) -> None:
-        print(f"[FSM] {t}  ->  {controller.fsm.active_configuration}")
+    def on_transition(state: Any) -> None:
+        print(f"[FSM] -> {controller.fsm.active_configuration}")
 
     def on_row(row: dict) -> None:
         print(
@@ -112,10 +111,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     controller.session_started.connect(lambda p: print(f"[CSV] session file: {p}"))
 
     if not controller.connect_ports():
-        print(f"[ERROR] {controller.last_error or controller.fsm.last_rejection}", file=sys.stderr)
+        print(f"[ERROR] {controller.last_error or 'connection failed'}", file=sys.stderr)
         return 2
     if not controller.start_run():
-        print(f"[ERROR] start rejected: {controller.fsm.last_rejection}", file=sys.stderr)
+        print("[ERROR] start rejected", file=sys.stderr)
         controller.shutdown()
         return 3
 

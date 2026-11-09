@@ -1,0 +1,3 @@
+pc_timestamp_s,qcm_freq_hz,delta_f_hz,df_dt_hz_s,dm_dt_ng_s,qcm_temp_c,flow_lpm,sht_temp_c,sht_rh_pct,pwm_duty,zoh_flow_age_s,zoh_sht_age_s
+237227.531,5000001,1.0,1.0,-3.6218704747685275,25.0,0.47,24.39,42.0,0,1.0,1.0
+237228.531,5000000,0.0,-1.0,3.6218704747685275,25.0,1.282,24.66,42.64,50,1.0,1.0

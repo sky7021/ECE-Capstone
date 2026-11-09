@@ -34,8 +34,9 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from statemachine.exceptions import TransitionNotAllowed
 
-from software.fsm.host_fsm import HostState, HostStateMachine, Transition
+from software.fsm.host_fsm import HostState, HostStateMachine
 from software.pipeline.csv_logger import DEFAULT_LOG_DIR, CSVLogger
 from software.pipeline.quality import FLOW_TIMEOUT_S, QCM_TIMEOUT_S, SHT_TIMEOUT_S
 from software.pipeline.zoh_fusion import ZOHFusionEngine
@@ -120,7 +121,7 @@ class HostController(QObject):
         )
         self.csv_logger = CSVLogger(self.config.log_dir)
         self.fsm = HostStateMachine(actions=_ControllerActions(self))
-        self.fsm.add_listener(self._on_transition)
+        self.fsm.add_listener(self)
         self._bind_engine()
 
     # ================================================================ queries
@@ -133,36 +134,56 @@ class HostController(QObject):
     def connect_ports(self) -> bool:
         """``S0 -> S1``: guard ports, open them and spawn the reader QThreads."""
         self.last_error = None
-        ok = self.fsm.boot()
-        if not ok:
-            msg = self.last_error or self.fsm.last_rejection or "connection failed"
+        try:
+            self.fsm.boot()
+            return True
+        except TransitionNotAllowed as exc:
+            msg = self.last_error or str(exc)
             self.connection_failed.emit(msg)
-        return ok
+            return False
 
     @pyqtSlot(result=bool)
     def start_run(self) -> bool:
         """``S1 -> S2``: purge buffers, open session CSV, arm S2 priming."""
-        return self.fsm.start_run()
+        try:
+            self.fsm.start_run()
+            return True
+        except TransitionNotAllowed:
+            return False
 
     @pyqtSlot(int, result=bool)
     def set_fan_pwm(self, duty: int) -> bool:
         """``HS_CONNECTED -> S5 -> H``: transmit ``SET_PWM:<duty>``."""
-        return self.fsm.fan_pwm_changed(duty)
+        try:
+            self.fsm.fan_pwm_changed(duty)
+            return True
+        except TransitionNotAllowed:
+            return False
 
     @pyqtSlot(str)
     def on_fault_triggered(self, error_msg: str) -> None:
         """``HS_CONNECTED -> S4`` group preemptive exit."""
-        self.fsm.fault(error_msg)
+        try:
+            self.fsm.fault(error_msg)
+        except TransitionNotAllowed:
+            pass
 
     @pyqtSlot(result=bool)
     def confirm_fault(self) -> bool:
         """``S4 -> S0`` after the user acknowledges the fault modal."""
-        return self.fsm.fault_confirmed()
+        try:
+            self.fsm.fault_confirmed()
+            return True
+        except TransitionNotAllowed:
+            return False
 
     @pyqtSlot()
     def shutdown(self) -> None:
         """Direct termination (app exit / SIGINT / SIGTERM)."""
-        self.fsm.shutdown()
+        try:
+            self.fsm.shutdown()
+        except TransitionNotAllowed:
+            pass
 
     # ======================================================== signal wiring
     def _bind_engine(self) -> None:
@@ -215,28 +236,38 @@ class HostController(QObject):
     def _on_worker_fault(self, msg: str) -> None:
         if not self._is_current_worker(self.sender()):
             return
-        self.fsm.fault(msg)
+        try:
+            self.fsm.fault(msg)
+        except TransitionNotAllowed:
+            pass
 
     # ---------------------------------------------------------- engine slots
     @pyqtSlot(int, float)
     def _on_qcm_tare_ready(self, f_hz: int, t_c: float) -> None:
-        self.fsm.qcm_tare_ready()
+        try:
+            self.fsm.qcm_tare_ready()
+        except TransitionNotAllowed:
+            pass
 
     @pyqtSlot(dict)
     def _on_aux_zoh_primed(self, aux: dict) -> None:
-        self.fsm.aux_zoh_primed()
+        try:
+            self.fsm.aux_zoh_primed()
+        except TransitionNotAllowed:
+            pass
 
     @pyqtSlot(int, float)
     def _on_join_complete(self, f0_hz: int, t0_c: float) -> None:
-        if not self.fsm.join_completed(f0_hz, t0_c):
+        try:
+            self.fsm.join_completed(f0_hz, t0_c)
+        except TransitionNotAllowed as exc:
             # Data plane and control plane disagree - never stream un-tared data.
-            self.fsm.fault(f"internal: S2 join rejected ({self.fsm.last_rejection})")
+            self.fsm.fault(f"internal: S2 join rejected ({exc})")
 
     # -------------------------------------------------------- FSM listener
-    def _on_transition(self, t: Transition) -> None:
-        if HostState.S2_TARE_AND_PRIME in (t.source, t.target):
-            self.s2_progress.emit(self.fsm.in_s2_a2, self.fsm.in_s2_b2)
-        self.state_changed.emit(t)
+    def after_transition(self, event: Any, source: Any, target: Any, **kwargs: Any) -> None:
+        self.s2_progress.emit(self.fsm.in_s2_a2, self.fsm.in_s2_b2)
+        self.state_changed.emit(self.fsm.state)
 
     # ------------------------------------------------------ action helpers
     def _teardown_workers(self) -> None:

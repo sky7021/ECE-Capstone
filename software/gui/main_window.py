@@ -10,7 +10,7 @@ from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QMainWindow, QMessageBox, QVBoxLayout, QWidget
 
 from software.fsm.host_controller import HostConfig, HostController
-from software.fsm.host_fsm import HostState, HostStateMachine, Transition
+from software.fsm.host_fsm import HostState, HostStateMachine
 from software.gui.views.diagnostic_view import DiagnosticView
 from software.gui.views.time_series_view import TimeSeriesView
 from software.pipeline.csv_logger import CSVLogger
@@ -145,9 +145,10 @@ class MainWindow(QMainWindow):
     def aux_reader(self, reader: Optional[AuxReader]) -> None:
         self.controller.aux_reader = reader
 
-    def _sync_from_transition(self, t: Transition) -> None:
-        self.diagnostic_view.status_indicator.set_state(t.target)
-        if t.target is HostState.S2_TARE_AND_PRIME:
+    def _sync_from_transition(self, target: Any) -> None:
+        state = target.target if hasattr(target, "target") else target
+        self.diagnostic_view.status_indicator.set_state(state)
+        if state is HostState.S2_TARE_AND_PRIME:
             self.diagnostic_view.status_indicator.set_s2_locks(
                 self.fsm.in_s2_a2, self.fsm.in_s2_b2
             )

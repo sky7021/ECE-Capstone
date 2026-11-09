@@ -6,7 +6,6 @@ from software.fsm.host_fsm import (
     HostState,
     HostStateMachine,
     QCMTareRegion,
-    Transition,
 )
 
 __all__ = [
@@ -15,6 +14,4 @@ __all__ = [
     "HostState",
     "HostStateMachine",
     "QCMTareRegion",
-    "Transition",
 ]
-

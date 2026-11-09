@@ -10,55 +10,7 @@
 
 The platform operates as three physically decoupled, communicating Finite State Machines (CFSMs)—the **Host PC**, the **Espressif ESP32**, and the **Digilent Basys 3 Artix-7 FPGA**—connected via two independent USB-over-UART physical links at $115,200\text{ baud}$ (`8N1`).
 
-```
-+-----------------------------------------------------------------------------------+
-|                        AEROSOL MEASUREMENT CHAMBER / DUCT                         |
-|                                                                                   |
-|  +-----------------------------+               +-------------------------------+  |
-|  | 5 MHz QCM Crystal (openQCM) |               | Omron D6F-V03A1 Airflow (ADC) |  |
-|  | + MCP9808 Temp Sensor (I2C) |               | Sensirion SHT21 Temp/RH (I2C) |  |
-|  +--------------+--------------+               | 5V Chamber Fan (25 kHz PWM)   |  |
-|                 |                              +---------------+---------------+  |
-+-----------------|----------------------------------------------|------------------+
-                  | Pmod JA (CMOS + I2C)                         | ADC1 / I2C / LEDC
-                  v                                              v
-     +--------------------------+                   +--------------------------+
-     |      BASYS 3 FPGA        |                   |    ESP32 MICROCONTROLLER |
-     |  Free-Running TX-Only    |                   |   Dual-Core Always-On    |
-     |  1 Hz Gate & Serializer  |                   |  Core 0: 1 Hz Multi-Rate |
-     |  (F0 -> F1 -> F2 -> F3)  |                   |  Core 1: RX PWM Listener |
-     +------------+-------------+                   +------------+-------------+
-                  |                                              |
-                  | USB-UART Link A                              | USB-UART Link B
-                  | 115,200 baud, 8N1 (TX-Only)                  | 115,200 baud, 8N1 (Bidir)
-                  | 1 Hz ASCII: QCM_FREQ, TEMP_X16               | 1 Hz ASCII: FLOW, TEMP, RH, PWM
-                  |                                              | Uplink: SET_PWM:<duty>\n
-                  v                                              v
-+-----------------------------------------------------------------------------------+
-|                       HOST PC (MASTER ORCHESTRATOR & GUI)                         |
-|                                                                                   |
-|  +----------------------------+                 +------------------------------+  |
-|  | QCMReader (QThread Worker) |                 | AuxReader (QThread Worker)   |  |
-|  | Regex Parser & 3s Watchdog |                 | Regex Parser, 3s/6s Watchdog |  |
-|  +--------------+-------------+                 +--------------+---------------+  |
-|                 | pyqtSignal(ts, freq, temp)                   | pyqtSignal(ts, dict)
-|                 +----------------------+-----------------------+                  |
-|                                        v                                          |
-|                 +----------------------------------------------+                  |
-|                 | ZOHFusionEngine & SauerbreyCalculator        |                  |
-|                 | - S2: Orthogonal Tare & ZOH Prime Join       |                  |
-|                 | - S3: 1 Hz ZOH Fusion, delta_f, dm/dt        |                  |
-|                 +----------------------+-----------------------+                  |
-|                                        | pyqtSignal(fused_dict)                   |
-|                         +--------------+--------------+                           |
-|                         v                             v                           |
-|          +-----------------------------+ +---------------------------+            |
-|          | MainWindow (PyQt6/pyqtgraph)| | CSVLogger (Session Store) |            |
-|          | 60 FPS Plots & S0-S5 FSM    | | Flush/Close on S4 or Exit |            |
-|          +-----------------------------+ +---------------------------+            |
-+-----------------------------------------------------------------------------------+
-
-```
+On the Host PC, the architecture strictly segregates the **Control Plane** (`software/fsm/host_fsm.py` using `python-statemachine` v3.2.2 `StateChart` with compound states, orthogonal regions, and deep history, coordinated via `HostController` in `software/fsm/host_controller.py` and executable headlessly via `software/fsm/headless.py`) from the **Data Plane** (`software/pipeline/zoh_fusion.py` real-time 1 Hz packet ingestion, Zero-Order-Hold caching, Sauerbrey derivative calculations, and CSV session logging). All cross-boundary messaging uses thread-safe PyQt6 signals and slots.
 
 ### Strict Architectural Guardrails for Coding Agents
 
@@ -66,7 +18,7 @@ The platform operates as three physically decoupled, communicating Finite State 
 
 2. **Single-Crystal QCM Compensation:** The FPGA counts a single $5\text{ MHz}$ QCM oscillator (`QCM_FREQ`) over a $1\text{ s}$ gate and polls an on-holder MCP9808 temperature sensor (`TEMP_X16`) over $\text{I}^2\text{C}$. Do **not** expect dual-crystal (`f_sense`, `f_ref`) binary packets or 20-byte/23-byte binary struct framing.
 
-3. **Non-Blocking GUI Thread:** All `pyserial` operations (`readline()`, `write()`, `reset_input_buffer()`) **must** execute inside dedicated `QThread` workers (`qcm_reader.py`, `aux_reader.py`). Communication with the GUI (`main_window.py`) and pipeline (`zoh_fusion.py`) must use thread-safe `pyqtSignal` and `pyqtSlot` connections.
+3. **Non-Blocking GUI Thread & Decoupled FSM Control Plane:** All `pyserial` operations (`readline()`, `write()`, `reset_input_buffer()`) **must** execute inside dedicated `QThread` workers (`qcm_reader.py`, `aux_reader.py`). Communication between the GUI (`main_window.py`), the master FSM controller (`host_controller.py`), the serial workers, and the pipeline engine (`zoh_fusion.py`) must use thread-safe `pyqtSignal` and `pyqtSlot` connections. The FSM operates synchronously on the main thread via declarative UML `StateChart` transitions without cross-thread re-entrancy risks.
 
 4. **Hardware-Accelerated Plotting Only:** Use `pyqtgraph` exclusively for real-time time-series plotting (`time_series_view.py`). Never import or embed `matplotlib` canvases in the real-time GUI loop.
 
@@ -140,86 +92,63 @@ The platform operates as three physically decoupled, communicating Finite State 
 
 ## 3. Finite State Machine (FSM) Specifications
 
-### I. Host PC Finite State Machine (Master Orchestrator)
+### I. Host PC Finite State Machine (Master Orchestrator Control Plane)
 
-The Host PC state machine uses hierarchical **OR-Superstates** (`HS_CONNECTED: SERIAL_CONNECTED`), **AND-Superstates** (`S2: TARE_AND_PRIME` with orthogonal regions `S2.1` and `S2.2`), and a **History Pseudostate (`H`)** for non-intrusive PWM fan actuation.
+The Host PC control plane is implemented as a declarative UML StateChart in [`software/fsm/host_fsm.py`](file:///software/fsm/host_fsm.py) using the **`python-statemachine`** library (`statemachine.StateChart` v3.2.2). It strictly isolates control-plane state transitions from data-plane mathematical operations ([`software/pipeline/zoh_fusion.py`](file:///software/pipeline/zoh_fusion.py)) and asynchronous serial I/O workers ([`software/readers/`](file:///software/readers/)).
 
-```
-                        +-------------------------------+
-                        |   S0: DISCONNECTED / BOOT     |
-                        +-------+---------------+-------+
-                                |               ^
-                   program boot |               | program shutoff /
-            [ports healthy]     |               | [confirm GUI fault pop-up]
-                                v               |
-+-------------------------------+---------------+-----------------------------------+
-| HS_CONNECTED: SERIAL_CONNECTED (OR-SUPERSTATE)                                    |
-|                                                                                   |
-|  +-------+            +-------------------------------+                           |
-|  |  (H)  |            |      S1: IDLE / STANDBY       |                           |
-|  +---+---+            +---------------+---------------+                           |
-|      ^                                |                                           |
-|      |                                | user clicks Start [healthy ports] /       |
-|      |                                | reset_input_buffer(), open CSV,           |
-|      |                                | start serial readers                      |
-|      |                                v                                           |
-|      |        +-------------------------------------------------------+           |
-|      |        | S2: TARE_AND_PRIME (AND-SUPERSTATE) / open CSV        |           |
-|      |        |---------------------------+---------------------------|           |
-|      |        | S2.1: R_AUX_PRIME (1 Hz)  | S2.2: R_QCM_TARE (1 Hz)   |           |
-|      |        |                           |                           |           |
-|      |        |  +---------------------+  |  +---------------------+  |           |
-|      |        |  | S2.B1:              |  |  | S2.A1:              |  |           |
-|      |        |  | WAIT_AUX_FIRST      |  |  | WAIT_QCM_FIRST      |  |           |
-|      |        |  +----------+----------+  |  +----------+----------+  |           |
-|      |        |             | Valid AUX   |             | Valid QCM   |           |
-|      |        |             | [Regex &    |             | [Regex OK]  |           |
-|      |        |             |  Health OK] |             v             |           |
-|      |        |             v             |  +---------------------+  |           |
-|      |        |  +---------------------+  |  | S2.A2:              |  |           |
-|      |        |  | S2.B2:              |  |  | QCM_TARE_READY      |  |           |
-|      |        |  | AUX_ZOH_PRIMED      |  |  | (init baseline freq |  |           |
-|      |        |  | (init flow, temp,RH)|  |  |  & QCM temp)        |  |           |
-|      |        |  +---------------------+  |  +---------------------+  |           |
-|      |        +---------------------------+---------------------------+           |
-|      |                                |                                           |
-|      |                                | join completion [in(S2.A2) && in(S2.B2)] /|
-|      |                                | freeze baseline QCM freq & temp,          |
-|      |                                | prime ZOH_cache                           |
-|      |                                v                                           |
-|      |                +-------------------------------+                           |
-|      |                | S3: ACTIVE_STREAMING &        |<--+ Valid QCM [Regex OK & |
-|      |                |     ZOH_FUSION                |---+ Age<=3s Flow, <=6s SHT|
-|      |                +-------------------------------+<--+ / compute & log       |
-|      |                                                  --+ Valid AUX [Regex OK]  |
-|      |                                                      / refresh ZOH_cache   |
-+------+----------------------------------------------------------------------------+
-       |                        |                               |
-       |                        | user inputs FAN pwm slider    | [SerialException,
-       |                        | [0 <= duty <= 100]            |  >3s QCM/Flow or
-       |                        v                               |  >6s SHT21]
-       |        +-------------------------------+               v
-       +--------+ S5: PWM FAN /                 |       +-----------------------+
-                | TX: SET_PWM:<duty>\n          |       |       S4: FAULT       |
-                +-------------------------------+       +-----------------------+
+#### Declarative UML StateChart Architecture (`HostStateMachine`)
 
-```
+The `HostStateMachine` subclasses `statemachine.StateChart` with `allow_event_without_transition = False`, enforcing strict Run-To-Completion (RTC) semantics with zero manual event queuing boilerplate:
+
+1. **State Topology & Hierarchy:**
+   * **Root State:** `s0_disconnected = State(HostState.S0_DISCONNECTED, initial=True, value=HostState.S0_DISCONNECTED)` represents uninitialized or parked hardware.
+   * **Hierarchical OR-Superstate (`hs_connected`):** A `State.Compound` encompassing all operational states where serial handles are open and threads are running. Unhandled events in any substate bubble up to `hs_connected`.
+     * **Deep History Pseudostate (`h`):** Defined as `h = HistoryState(type=HistoryType.DEEP)`. Natively stores and restores the active substate and orthogonal region configuration across transient interruptions.
+     * **Standby Substate (`s1_idle`):** `State(HostState.S1_IDLE_STANDBY, initial=True, value=HostState.S1_IDLE_STANDBY)`. Serial workers are idling and streaming raw health frames before session start.
+     * **Orthogonal AND-Superstate (`s2_tare_prime`):** `State.Parallel` with `value=HostState.S2_TARE_AND_PRIME`, containing two concurrent, independent compound regions:
+       * **Aux Prime Region (`r_aux`):** `b1 = State(AuxPrimeRegion.B1_WAIT_AUX_FIRST, initial=True)` and `b2 = State(AuxPrimeRegion.B2_AUX_ZOH_PRIMED)`. Transition `aux_zoh_primed = b1.to(b2)` latches upon the first valid AUX record with `health_ok == True`.
+       * **QCM Tare Region (`r_qcm`):** `a1 = State(QCMTareRegion.A1_WAIT_QCM_FIRST, initial=True)` and `a2 = State(QCMTareRegion.A2_QCM_TARE_READY)`. Transition `qcm_tare_ready = a1.to(a2)` latches upon the first valid QCM record.
+     * **Active Streaming Substate (`s3_active`):** `State(HostState.S3_ACTIVE_STREAMING, value=HostState.S3_ACTIVE_STREAMING)`. Real-time $1\text{ Hz}$ Sauerbrey mass calculations, ZOH freshness evaluation, and CSV recording.
+   * **Preemptive Fault State (`s4_fault`):** `State(HostState.S4_FAULT, value=HostState.S4_FAULT)`. Reached via group preemptive transition upon serial link failure, timeout, or sensor staleness. Hardware is parked and CSV is flushed.
+   * **Transient Actuation State (`s5_pwm_fan`):** `State(HostState.S5_PWM_FAN, value=HostState.S5_PWM_FAN)`. Transient state for transmitting `SET_PWM:<duty>\n` uplink commands.
+
+2. **Declarative Transitions & Event Triggers:**
+   * `boot`: `s0_disconnected.to(hs_connected.s1_idle, cond=["guard_ports_available", "guard_open_hardware"])`
+   * `start_run`: `hs_connected.s1_idle.to(hs_connected.s2_tare_prime, cond="guard_ports_healthy", on="do_begin_session")`
+   * `join_completed`: `hs_connected.s2_tare_prime.to(hs_connected.s3_active, cond=["in_s2_a2", "in_s2_b2"], on="do_begin_streaming")`
+   * `fan_pwm_changed`: `hs_connected.to(s5_pwm_fan, cond="guard_valid_duty", before="do_store_history", on="do_transmit_pwm")`
+   * **Eventless Deep History Return:** `s5_pwm_fan.to(hs_connected.h, cond="can_return_from_s5")`. Fires immediately without external triggers, returning to the exact prior substate (including the simultaneous `r_aux` and `r_qcm` substate positions if interrupted during `S2`).
+   * **Group Preemptive Exit (`fault`):** `s4_fault.from_(hs_connected, s5_pwm_fan, before="do_park_hardware", on="do_show_fault")`. Automatically preempts any active substate in `hs_connected` or `s5_pwm_fan`.
+   * `fault_confirmed`: `s4_fault.to(s0_disconnected, before="do_clear_fault")`. Triggered when user confirms the modal fault alert.
+   * `shutdown`: `(s0_disconnected.from_(hs_connected, s5_pwm_fan, s4_fault, before="do_terminate") | s0_disconnected.to.itself(internal=True, on="do_terminate"))`. Direct application termination from any state.
+
+3. **Action Delegation Protocol (`HostActions`):**
+   * The FSM contains zero hardware or GUI coupling. All external side effects and guards are defined in a typed `HostActions(Protocol)`:
+     * Guards: `ports_available() -> bool`, `ports_healthy() -> bool`.
+     * Lifecycle Actions: `open_hardware() -> bool`, `begin_session() -> None`, `begin_streaming(f0_hz: int, t0_c: float) -> None`, `transmit_pwm(duty: int) -> None`, `park_hardware(reason: str) -> None`, `show_fault(reason: str) -> None`, `clear_fault() -> None`, `terminate() -> None`.
+   * `NullActions`: Default no-op implementation with permissive guards for dry runs and headless unit testing.
+   * `_ControllerActions`: Implementation provided by `HostController` in [`software/fsm/host_controller.py`](file:///software/fsm/host_controller.py), bridging the FSM with Qt serial workers, CSV logging, and GUI signals.
+
+4. **Exception Handling & RTC Semantics:**
+   * Calling a transition when invalid raises `statemachine.exceptions.TransitionNotAllowed`, cleanly caught by `HostController` public slots.
+   * Action failures inside `hs_connected` automatically escalate to `fault(reason=...)` via `_run()`.
+   * Transition progress is observed via `after_transition()`, which notifies listeners (`add_listener()`) and emits Qt signals (`state_changed`, `s2_progress`).
 
 #### Host PC State Transition Table
 
-| Current State | Trigger / Event | Guard Condition | Next State | Output / Action | 
+| Current State | Trigger / Method | Guard Condition | Next State | Output / Action (`HostActions`) | 
 | ----- | ----- | ----- | ----- | ----- | 
-| **`S0: DISCONNECTED / BOOT`** | App initializes | Both COM ports available (or `--mock` enabled) | `HS_CONNECTED` $\to$ `S1: IDLE / STANDBY` | Open `pyserial` ports ($115,200\text{ baud}$); spawn `QThread` workers (`QCMReader`, `AuxReader`). | 
-| **`HS_CONNECTED (S1/S2/S3)`** | UI Fan Slider Changed | $0 \le \text{duty} \le 100$ | `S5: PWM FAN` $\to$ `(H)` | Transmit `SET_PWM:<duty>\n` over ESP32 UART uplink; immediately return to active substate (`S1`, `S2`, or `S3`) via History `(H)`. | 
-| **`S1: IDLE / STANDBY`** | User clicks "Start Run" | Ports healthy | `S2: TARE & PRIME` (`S2.A1`, `S2.B1`) | Call `reset_input_buffer()` on both ports; open session CSV via `csv_logger`; start `aux_reader` and `qcm_reader` priming ingestors. | 
-| **`S2.A1: WAIT_QCM_FIRST`** | Valid QCM ASCII line | Regex `pat.search(line)` matches | `S2.A2: QCM_TARE_READY` | Parse ASCII line; store initial QCM baseline frequency $f_0$ and crystal temperature $T_{\text{qcm}}(0)$. | 
-| **`S2.B1: WAIT_AUX_FIRST`** | Valid AUX ASCII line | Regex `pat.search(line)` matches & sensor health flags nominal | `S2.B2: AUX_ZOH_PRIMED` | Parse ASCII line; set initial AUX flow rate, SHT21 temperature, and relative humidity in ZOH buffer. | 
-| **`S2: TARE & PRIME`** | Join Completion | `in(S2.A2)` $\land$ `in(S2.B2)` | `S3: ACTIVE_STREAMING & ZOH_FUSION` | Freeze baseline QCM frequency $f_0$ and temperature $T_{\text{qcm}}(0)$; prime `ZOH_cache`; begin real-time Sauerbrey fusion and CSV logging. | 
-| **`S3: ACTIVE_STREAMING & ZOH_FUSION`** | Valid QCM ASCII line | Regex OK $\land$ ZOH fresh ($\text{Age}_{\text{flow}} \le 3\text{ s}$, $\text{Age}_{\text{sht}} \le 6\text{ s}$) | `S3: ACTIVE_STREAMING & ZOH_FUSION` | Parse ASCII; capture PC Python timestamp; fuse with `ZOH_cache`; compute Sauerbrey $\Delta f_{\text{particle}}$ and $\frac{dm}{dt}$; update plots; write CSV row. | 
-| **`S3: ACTIVE_STREAMING & ZOH_FUSION`** | Valid AUX ASCII line | Regex OK | `S3: ACTIVE_STREAMING & ZOH_FUSION` | Parse ASCII; refresh `ZOH_cache` (flow rate, SHT21 temp, humidity, PWM duty) and update cache timestamps. | 
-| **`HS_CONNECTED (S1/S2/S3)`** | Devices Unplugged (`SerialException`) / No-Data Timeout | Disconnected ports, no QCM/Flow ASCII for $> 3\text{ s}$, or no SHT21 for $> 6\text{ s}$ | `S4: FAULT` | **Group Preemptive Exit:** Invalidate `ZOH_cache`; halt derivative math; flush/close CSV; stop `QThread` workers & close `pyserial` ports; show modal GUI fault alert. | 
-| **`S4: FAULT`** | User confirms fault on GUI | User clicks modal confirmation | `S0: DISCONNECTED / BOOT` | Clear modal fault alert and reset GUI to disconnected state (hardware and ports already safely parked on `S4` entry). | 
-| **`HS_CONNECTED (S1/S2/S3)`** | User closes application | Application exit requested | `S0: DISCONNECTED / BOOT` | Direct termination: flush and close CSV, stop `QThread` workers, close `pyserial` ports, exit GUI. | 
+| **`S0: DISCONNECTED / BOOT`** | `boot()` | `ports_available` $\land$ `open_hardware` | `HS_CONNECTED` $\to$ `S1: IDLE / STANDBY` | Open serial handles; spawn and start `QCMReader` & `AuxReader` `QThread` workers. | 
+| **`HS_CONNECTED (S1/S2/S3)`** | `fan_pwm_changed(duty)` | `guard_valid_duty` ($0 \le \text{duty} \le 100$) | `S5: PWM FAN` $\to$ `(H)` | `do_store_history`; transmit `SET_PWM:<duty>\n` via `transmit_pwm`; eventless return to `(H)`. | 
+| **`S1: IDLE / STANDBY`** | `start_run()` | `ports_healthy` | `S2: TARE & PRIME` (`S2.A1`, `S2.B1`) | `do_begin_session`: purge input buffers on both ports, open session CSV, reset engine for tare. | 
+| **`S2.A1: WAIT_QCM_FIRST`** | `qcm_tare_ready()` | First valid QCM packet received | `S2.A2: QCM_TARE_READY` | Latch tentative baseline frequency $f_0$ and crystal temperature $T_{\text{qcm}}(0)$; evaluate join. | 
+| **`S2.B1: WAIT_AUX_FIRST`** | `aux_zoh_primed()` | First valid AUX packet $\land$ `health_ok == True` | `S2.B2: AUX_ZOH_PRIMED` | Prime `ZOHCache` (flow, temp, RH, PWM); evaluate join. | 
+| **`S2: TARE & PRIME`** | `join_completed(f0_hz, t0_c)` | `in_s2_a2` $\land$ `in_s2_b2` | `S3: ACTIVE_STREAMING & ZOH_FUSION` | `do_begin_streaming`: freeze baseline in Sauerbrey engine, transition engine to streaming. | 
+| **`S3: ACTIVE_STREAMING & ZOH_FUSION`** | QCM packet received | Fresh ZOH ($\text{Age}_{\text{flow}} \le 3\text{ s}$, $\text{Age}_{\text{sht}} \le 6\text{ s}$) | `S3: ACTIVE_STREAMING & ZOH_FUSION` | Data-plane loop: fuse with `ZOHCache`, compute $\Delta f_{\text{particle}}$ and $\frac{dm}{dt}$, emit `fused_row_ready`, log CSV. | 
+| **`S3: ACTIVE_STREAMING & ZOH_FUSION`** | AUX packet received | Regex & values finite | `S3: ACTIVE_STREAMING & ZOH_FUSION` | Data-plane loop: refresh `ZOHCache` (flow, PWM; SHT temp/RH on fresh flag). | 
+| **`HS_CONNECTED (S1/S2/S3)`** | `fault(reason)` / worker error / timeout | Link fault, watchdog timeout, or staleness | `S4: FAULT` | **Group Preemptive Exit:** `do_park_hardware` (invalidate cache, flush/close CSV, stop workers); `do_show_fault`. | 
+| **`S4: FAULT`** | `fault_confirmed()` | Modal alert acknowledged | `S0: DISCONNECTED / BOOT` | `do_clear_fault`: clear fault reason and reset GUI to disconnected state. | 
+| **`HS_CONNECTED / S4 / S5`** | `shutdown()` | App quit / SIGINT / SIGTERM | `S0: DISCONNECTED / BOOT` | Direct termination: `do_terminate` (`_release_all()`), close serial handles, exit cleanly. | 
 
 ### II. ESP32 Finite State Machine (Environmental & Actuator Node)
 
@@ -248,154 +177,223 @@ The Host PC state machine uses hierarchical **OR-Superstates** (`HS_CONNECTED: S
 ece490-qcm-platform/
 ├── .gitignore
 ├── README.md
-├── ARCHITECTURE.md                     # This specification file for agentic development
-├── requirements.txt                    # PyQt6, pyqtgraph, pyserial, numpy, pandas, scipy, pytest
+├── PROJECT_OVERVIEW.md
+├── codebase_learning_guide.md
+├── capstone_agentic_architecture_specification.md  # System Architecture & Agentic Development Specification
+├── requirements.txt                    # PyQt6, pyqtgraph, pyserial, numpy, pandas, scipy, pytest, python-statemachine
+├── fpga_esp32_testing.py               # Hardware prototype test script
+├── proposed_setup1.py                  # Hardware prototype setup script
 │
 ├── software/                           # Host PC Master Orchestrator & Analytics Stack
 │   ├── __init__.py
-│   ├── gui/                            # Presentation Layer & Top-Level FSM Controller
+│   ├── fsm/                            # Declarative Control Plane & StateChart Engine
 │   │   ├── __init__.py
-│   │   ├── app.py                      # Entry point, CLI parser, QThread lifecycle & signal wiring
-│   │   ├── main_window.py              # Master GUI window, Host FSM state manager (S0-S5), fault modals
+│   │   ├── host_fsm.py                 # Declarative UML StateChart (HostStateMachine via python-statemachine)
+│   │   ├── host_controller.py          # Unified HostController (QObject), slots, signal wiring & actions
+│   │   └── headless.py                 # Headless runner for automated testing & CI without GUI
+│   ├── gui/                            # Presentation Layer & GUI Widgets
+│   │   ├── .gitkeep
+│   │   ├── __init__.py
+│   │   ├── base.py                     # Main event loop driver stub
+│   │   ├── app.py                      # Application entry point, CLI parser & ApplicationController
+│   │   ├── main_window.py              # Master GUI window, views coordination, fault modal handling
 │   │   ├── views/
 │   │   │   ├── __init__.py
 │   │   │   ├── time_series_view.py     # 60 FPS pyqtgraph waveforms (f_qcm, delta_f, dm/dt, Temp)
-│   │   │   └── diagnostic_view.py      # COM port health, ZOH indicators, S5 Fan PWM slider (0-100%)
+│   │   │   └── diagnostic_view.py      # Telemetry readouts, status badges, Start Run, Fan PWM slider
 │   │   └── widgets/
 │   │       ├── __init__.py
 │   │       ├── status_indicator.py     # LED state badges (S0-S5, S2.A2/S2.B2 locks, ZOH health)
 │   │       └── dynamic_ribbon.py       # Mean trajectory curve with +/-1 sigma confidence envelope
 │   │
 │   ├── readers/                        # Asynchronous UART-over-USB Ingestion Workers
+│   │   ├── .gitkeep
 │   │   ├── __init__.py
-│   │   ├── serial_worker.py            # Base QThread pyserial manager, buffer purge & fault handler
+│   │   ├── serial_worker.py            # Base QThread pyserial worker, TX queue, purge & fault handling
 │   │   ├── qcm_reader.py               # 1 Hz Basys 3 FPGA ASCII line parser & 3.0s watchdog
 │   │   ├── aux_reader.py               # 1 Hz ESP32 ASCII line parser, 3.0s/6.0s watchdogs & SET_PWM TX
 │   │   └── smps_adapter.py             # Reference TSI-AIM / SMPS delimited file watcher & scan parser
 │   │
 │   ├── pipeline/                       # Priming, Multi-Rate Data Fusion, Math & Storage Engine
+│   │   ├── .gitkeep
 │   │   ├── __init__.py
-│   │   ├── zoh_fusion.py               # S2 AND-superstate priming latch & S3 ZOH cache manager
+│   │   ├── zoh_fusion.py               # S2 AND-superstate priming latch, S3 ZOH fusion & engine phases
 │   │   ├── sauerbrey.py                # Baseline tare freeze, delta_f & Sauerbrey dm/dt derivative math
 │   │   ├── csv_logger.py               # Session CSV writer (open on S1->S2, log in S3, flush on S4/S0)
-│   │   ├── quality.py                  # Regex validators, health flag checks, ZOH age evaluators
+│   │   ├── quality.py                  # Standalone regex validators, health flag checks, ZOH age evaluators
 │   │   └── empirical_fit.py            # Integral dose transform (D_SMPS) & K_empirical solver
 │   │
 │   └── tests/                          # Hardware-Decoupled Emulation & Verification Suite
+│       ├── .gitkeep
 │       ├── __init__.py
+│       ├── conftest.py                 # Shared pytest fixtures (qapp, pump, wait_until, waiter)
 │       ├── serial_mock.py              # Synthetic 1 Hz FPGA & ESP32 ASCII generators (--mock mode)
-│       ├── virtual_loopback.py         # Virtual COM port pair orchestrator (pty / com0com)
-│       └── test_pipeline.py            # Unit tests for regex, S2 join completion, ZOH expiry & math
+│       ├── virtual_loopback.py         # Virtual serial pair orchestrator (InProcessLoopbackPair / pty / com0com)
+│       ├── test_host_fsm.py            # Pure-Python unit tests for HostStateMachine (37 tests)
+│       └── test_pipeline.py            # Integration tests for pipeline, mock readers & controller (56 tests)
 │
 ├── firmware/
-│   ├── fpga/                           # Basys 3 Artix-7 Verilog RTL & XDC constraints
-│   └── esp32/                          # ESP-IDF / Arduino Dual-Core C++ firmware
-├── hardware/                           # Altium schematics/PCB & 3D chamber/fixture CAD models
-└── docs/                               # Interface Control Docs & calibration manifests
-
+│   ├── fpga/                           # Basys 3 Artix-7 Verilog RTL & XDC constraints (.gitkeep)
+│   └── esp32/                          # ESP-IDF / Arduino Dual-Core C++ firmware (.gitkeep)
+├── hardware/
+│   ├── 3d_models/                      # 3D chamber/fixture CAD models (.gitkeep)
+│   ├── pcb/                            # Altium PCB layout files (.gitkeep)
+│   └── schematics/                     # Altium schematics (.gitkeep)
+└── docs/                               # Interface Control Docs & calibration manifests (.gitkeep)
 ```
 
 ### Detailed Host PC Module & Class Specifications
 
-#### A. `/software/gui/` — Presentation & FSM Orchestration
+#### A. `/software/fsm/` — Master Control Plane & Declarative StateChart
 
-1. **`software/gui/app.py`**
+1. **`software/fsm/host_fsm.py`**
 
-   * `parse_arguments() -> argparse.Namespace`: Parses `--mock` (enables in-process synthetic `QThread` generators), `--qcm-port`, `--aux-port`, `--baud` (default `115200`), and `--log-dir` (default `"data/sessions"`).
+   * `class HostState(Enum)`: Canonical states `S0_DISCONNECTED`, `S1_IDLE_STANDBY`, `S2_TARE_AND_PRIME`, `S3_ACTIVE_STREAMING`, `S4_FAULT`, `S5_PWM_FAN`. Includes `.label` and `.short` helper properties.
 
-   * `configure_signal_handling(app: QApplication, controller: ApplicationController) -> None`: Traps `SIGINT` and `SIGTERM` to invoke `controller.shutdown()`.
+   * `class QCMTareRegion(Enum)` & `class AuxPrimeRegion(Enum)`: Substate enums for orthogonal regions `S2.A1`/`S2.A2` and `S2.B1`/`S2.B2`.
 
-   * `class ApplicationController(QObject)`:
+   * `class HostActions(Protocol)`: Typed protocol defining hardware guards (`ports_available`, `ports_healthy`) and external lifecycle actions (`open_hardware`, `begin_session`, `begin_streaming`, `transmit_pwm`, `park_hardware`, `show_fault`, `clear_fault`, `terminate`).
 
-     * `init_workers(self) -> None`: Executes `S0: DISCONNECTED -> HS_CONNECTED (S1: IDLE)` guard check; opens `pyserial` ports (or spawns `MockQCMReader` / `MockAuxReader` if `--mock` is active) and starts worker threads.
+   * `class NullActions(HostActions)`: Default permissive implementation used for dry runs and unit testing.
 
-     * `bind_signals(self) -> None`: Connects `qcm_reader.qcm_packet_received` and `aux_reader.aux_packet_received` to `zoh_fusion`, wires `zoh_fusion.fused_row_ready` to `csv_logger.log_fused_row` and `main_window.update_plots`, and connects fault signals (`serial_fault`, `staleness_fault`) to `main_window.on_fault_triggered`.
+   * `class HostStateMachine(StateChart)`: Declarative UML StateChart built with `python-statemachine` (v3.2.2):
+     * State Hierarchy: Root state `s0_disconnected`, compound OR-superstate `hs_connected` (containing `h = HistoryState(type=HistoryType.DEEP)`, `s1_idle`, parallel AND-superstate `s2_tare_prime` with concurrent compound regions `r_aux` and `r_qcm`, and `s3_active`), `s4_fault`, and `s5_pwm_fan`.
+     * Public Declarative Transitions: `boot`, `start_run`, `join_completed`, `fan_pwm_changed`, eventless history return `s5_pwm_fan.to(hs_connected.h)`, group preemptive `fault`, `fault_confirmed`, and `shutdown`.
+     * Orthogonal Substate Transitions: `r_qcm.qcm_tare_ready` (`a1.to(a2)`) and `r_aux.aux_zoh_primed` (`b1.to(b2)`).
+     * Guards & Action Hooks: `guard_ports_available`, `guard_open_hardware`, `guard_ports_healthy`, `guard_valid_duty`, `can_return_from_s5`, `do_store_history`, `do_begin_session`, `do_begin_streaming`, `do_transmit_pwm`, `do_park_hardware`, `do_show_fault`, `do_clear_fault`, `do_terminate`.
+     * Public Query Properties: `state` (`HostState`), `history_state` (`Optional[HostState]`), `is_connected` (`bool`), `in_s2_a2` (`bool`), `in_s2_b2` (`bool`), `qcm_region` (`Optional[QCMTareRegion]`), `aux_region` (`Optional[AuxPrimeRegion]`), `active_configuration` (`str`), and `state_path()` (`list[HostState]`).
+     * Transition Listeners: `after_transition()` hook tracking state history and dispatching to registered callback listeners.
 
-     * `shutdown(self) -> None`: Executes `HS_CONNECTED -> S0: DISCONNECTED` direct termination (`csv_logger.flush_and_close()`, `qcm_reader.stop_and_close()`, `aux_reader.stop_and_close()`).
+2. **`software/fsm/host_controller.py`**
 
-2. **`software/gui/main_window.py`**
+   * `class HostConfig` (Dataclass): Configuration parameters including `mock: bool`, `qcm_port: Optional[str]`, `aux_port: Optional[str]`, `baud: int`, `log_dir: str`, `flow_timeout_s: float`, `sht_timeout_s: float`, `qcm_timeout_s: float`.
 
-   * `class HostState(Enum)`: `S0_DISCONNECTED`, `S1_IDLE_STANDBY`, `S2_TARE_AND_PRIME`, `S3_ACTIVE_STREAMING`, `S4_FAULT`, `S5_PWM_FAN`.
+   * `class HostController(QObject)`: Central orchestrator unifying control plane, data plane, serial workers, and CSV logging:
+     * Control-Plane Signals: `state_changed(object)`, `s2_progress(bool, bool)`, `connection_failed(str)`, `session_started(str)`, `streaming_started(int, float)`, `fault_raised(str)`, `fault_cleared()`.
+     * Data-Plane Signals: `qcm_packet(float, int, float)`, `aux_packet(float, dict)`, `fused_row_ready(dict)`, `pwm_command_sent(int)`.
+     * Public Qt Slots: `connect_ports() -> bool`, `start_run() -> bool`, `set_fan_pwm(duty: int) -> bool`, `on_fault_triggered(error_msg: str) -> None`, `confirm_fault() -> bool`, `shutdown() -> None`. Each slot catches `statemachine.exceptions.TransitionNotAllowed` to prevent unhandled FSM rejections from propagating.
+     * Worker Lifecycle & Filtering: `_bind_workers()` wires worker signals, `_teardown_workers()` safely joins threads and closes ports, and `_is_current_worker()` filters out late signals from previously torn-down workers.
+     * `_ControllerActions(HostActions)`: Concrete implementation of `HostActions` backed by the controller, handling port opening, buffer purging, CSV initialization, PWM transmission, and hardware parking.
+
+3. **`software/fsm/headless.py`**
+
+   * `parse_arguments() -> argparse.Namespace`: Parses CLI options (`--mock`, `--qcm-port`, `--aux-port`, `--baud`, `--log-dir`, `--duration`, `--pwm <DUTY@SECONDS>`, `-v/--verbose`).
+   * `configure_signal_handling(app: QCoreApplication, controller: HostController) -> QTimer`: Attaches POSIX and Windows signal handlers (`SIGINT`, `SIGTERM`) to trigger `controller.shutdown()`.
+   * `main(argv) -> int`: Headless execution loop running on `QCoreApplication` without GUI overhead; coordinates full run lifecycle, schedules Fan PWM steps, auto-acknowledges faults, and returns deterministic status exit codes.
+
+#### B. `/software/gui/` — Presentation Layer & GUI Widgets
+
+1. **`software/gui/base.py`**
+
+   * Lightweight module providing driver stubs and main loop entry points.
+
+2. **`software/gui/app.py`**
+
+   * `parse_arguments() -> argparse.Namespace`: Parses GUI arguments (`--mock`, `--qcm-port`, `--aux-port`, `--baud`, `--log-dir`).
+   * `configure_signal_handling(app: QCoreApplication, controller: HostController) -> QTimer`: Sets up clean shutdown on `SIGINT` / `SIGTERM`.
+   * `class ApplicationController(QObject)`: Backwards-compatible adapter delegating lifecycle management, worker properties, and signal wiring to unified `HostController` and `MainWindow`.
+
+3. **`software/gui/main_window.py`**
 
    * `class MainWindow(QMainWindow)`:
+     * Observes `HostController` transitions via `state_changed` and `s2_progress` signals; receives active `HostState` directly.
+     * Synchronizes `StatusIndicator` LED badges (including orthogonal `in_s2_a2` and `in_s2_b2` locks).
+     * Updates 60 FPS pyqtgraph subplots upon `fused_row_ready`.
+     * Manages modal `QMessageBox.critical` on fault and acknowledges via `controller.confirm_fault()`.
 
-     * Attributes: `current_state: HostState`, `history_state: HostState` (tracks `H` inside `HS_CONNECTED`).
+4. **`software/gui/views/diagnostic_view.py` & `time_series_view.py`**
 
-     * `on_ports_connected(self) -> None`: Transitions `S0 -> S1: IDLE / STANDBY`.
-
-     * `on_start_run_clicked(self) -> None`: Transitions `S1 -> S2: TARE_AND_PRIME`; calls `purge_input_buffer()` on both readers, opens a new session CSV via `csv_logger.open_session_csv()`, and calls `zoh_fusion.reset_for_tare()`.
-
-     * `on_join_completed(self, f0_hz: int, t0_c: float) -> None`: Transitions `S2 -> S3: ACTIVE_STREAMING & ZOH_FUSION`.
-
-     * `on_fan_slider_changed(self, duty: int) -> None`: Validates $0 \le \text{duty} \le 100$ while in `HS_CONNECTED (S1/S2/S3)`; saves `self.history_state = self.current_state`; transitions to `S5_PWM_FAN`; emits `SET_PWM:<duty>\n` to `aux_reader.send_pwm_command(duty)`; restores `self.current_state = self.history_state`.
-
-     * `on_fault_triggered(self, error_msg: str) -> None`: Executes Group Preemptive Exit (`HS_CONNECTED -> S4: FAULT`); invalidates `ZOH_cache`, halts Sauerbrey derivative math, flushes/closes CSV, stops `QThread` workers, closes serial ports, and opens blocking `QMessageBox.critical` modal alert.
-
-     * `on_fault_modal_confirmed(self) -> None`: Transitions `S4: FAULT -> S0: DISCONNECTED` upon modal confirmation and resets UI controls.
-
-3. **`software/gui/views/time_series_view.py` & `diagnostic_view.py`**
-
+   * `class DiagnosticView(QWidget)`: Telemetry and actuator panel rendering `StatusIndicator`, "Start Run" button, 0–100% Fan PWM `QSlider`, and digital readouts for D6F flow rate ($\text{L/min}$), SHT21 RH ($\%$), and ZOH age indicators. *(Note: COM ports are configured via CLI / `HostConfig` rather than GUI dropdowns).*
    * `class TimeSeriesView(QWidget)`: Manages 4 synchronized `pyqtgraph.PlotWidget` subplots:
-
      1. Raw QCM Frequency $f_{\text{qcm}}(t)$ ($\text{Hz}$)
-
      2. Tared Frequency Shift $\Delta f_{\text{particle}}(t)$ ($\text{Hz}$)
-
      3. Sauerbrey Mass Deposition Rate $\frac{dm}{dt}$ ($\text{ng/s}$)
-
      4. Crystal Holder Temperature $T_{\text{qcm}}(t)$ vs. SHT21 Chamber Temperature $T_{\text{sht}}(t)$ ($^\circ\text{C}$)
 
-   * `class DiagnosticView(QWidget)`: Renders COM port selectors, "Start Run" button, 0–100% Fan PWM `QSlider`, and digital readouts for D6F flow rate ($\text{L/min}$), SHT21 RH ($\%$), and ZOH cache freshness badges.
+5. **`software/gui/widgets/status_indicator.py` & `dynamic_ribbon.py`**
 
-#### B. `/software/readers/` — Asynchronous Serial Ingestion Workers
+   * `class StatusIndicator(QWidget)`: LED state badges (`S0`–`S5`), dual `S2` lock badges (`QCM Tare`, `AUX Prime`), and ZOH cache health indicators.
+   * `class DynamicRibbon`: Computes mean trajectory curve with $\pm 1\sigma$ confidence envelope for real-time drift estimation.
+
+#### C. `/software/readers/` — Asynchronous Serial Ingestion Workers
 
 1. **`software/readers/serial_worker.py`**
 
    * `class BaseSerialWorker(QThread)`:
-
-     * Signal: `serial_fault = pyqtSignal(str)`
-
-     * Methods: `open_port() -> bool`, `purge_input_buffer() -> None` (wraps `self.ser.reset_input_buffer()`), `stop_and_close() -> None`.
+     * Signals: `serial_fault = pyqtSignal(str)` and `bytes_transmitted = pyqtSignal(bytes)`.
+     * Thread-Safe GUI Methods: `open_port() -> bool`, `purge_input_buffer() -> None` (sets `_purge_evt` for worker loop to execute `reset_input_buffer()`), `enqueue_tx(data: bytes) -> None` (appends bytes to internal `queue.Queue`), and `stop_and_close() -> None`.
+     * Worker Execution Loop (`run()`): All `readline()`, `write()`, and buffer purges execute inside the worker thread. Drains TX queue via `_drain_tx()` emitting `bytes_transmitted`, enforces `MAX_LINE_BYTES = 4096` buffer protection, and polls watchdogs at $\ge 10\text{ Hz}$.
 
 2. **`software/readers/qcm_reader.py`**
 
    * `class QCMReader(BaseSerialWorker)`:
-
      * Signal: `qcm_packet_received = pyqtSignal(float, int, float)` (`pc_timestamp`, `qcm_freq_hz`, `qcm_temp_c`).
-
-     * Watchdog: Emits `serial_fault("QCM timeout > 3.0s")` if `time.monotonic() - last_valid_ts > 3.0`.
-
-     * `parse_ascii_line(self, line: bytes) -> Optional[tuple[int, float]]`: Matches `rb"QCM_FREQ=(\d+),TEMP_X16=(-?\d+)"` and returns `(int(m.group(1)), int(m.group(2)) / 16.0)`.
+     * Parser: Standalone/static parser `parse_ascii_line(line: bytes)` delegating to `quality.parse_qcm_line()`.
+     * Watchdog: Emits `serial_fault("QCM timeout > 3.0s")` if elapsed time since last valid packet exceeds $3.0\text{ s}$.
 
 3. **`software/readers/aux_reader.py`**
 
    * `class AuxReader(BaseSerialWorker)`:
-
      * Signal: `aux_packet_received = pyqtSignal(float, dict)` (`pc_timestamp`, `aux_dict`).
-
+     * Parser: Standalone/static parser `parse_ascii_line(line: bytes)` delegating to `quality.parse_aux_line()`.
      * Watchdogs: Emits `serial_fault` if flow packet interval $> 3.0\text{ s}$ or fresh SHT21 (`FRESH=1`) interval $> 6.0\text{ s}$.
+     * Actuation Uplink: `send_pwm_command(duty: int) -> None` formats `SET_PWM:<duty>\n` and calls `enqueue_tx()` without clearing the RX input buffer.
 
-     * `parse_ascii_line(self, line: bytes) -> Optional[dict]`: Extracts `flow_lpm`, `sht_temp_c`, `sht_rh_pct`, `pwm_duty`, `fresh_flag`, and `health_ok`.
+4. **`software/readers/smps_adapter.py`**
 
-     * `send_pwm_command(self, duty: int) -> None`: Thread-safe slot that enqueues `f"SET_PWM:{duty}\n".encode("ascii")` for immediate transmission on the ESP32 serial port.
+   * Watcher and parser for TSI-AIM reference SMPS scan exports.
 
-#### C. `/software/pipeline/` — Priming, ZOH Fusion & Mathematical Engine
+#### D. `/software/pipeline/` — Priming, ZOH Fusion & Mathematical Engine
 
 1. **`software/pipeline/zoh_fusion.py`**
 
-   * `class ZOHCache` (Dataclass): Holds `flow_lpm: float`, `sht_temp_c: float`, `sht_rh_pct: float`, `pwm_duty: int`, `last_flow_ts: float`, `last_sht_ts: float`, `is_valid: bool = False`.
-
+   * `class ZOHCache` (Dataclass): Holds `flow_lpm: float`, `sht_temp_c: float`, `sht_rh_pct: float`, `pwm_duty: int`, `last_flow_ts: float`, `last_sht_ts: float`, `is_valid: bool = False`, and `health_ok: bool = False`. Provides `prime()`, `refresh()`, and `invalidate()`.
+   * `class FusionMode(Enum)` / Engine Phase: `DISARMED` (S0/S1/S4), `PRIMING` (S2), `STREAMING` (S3).
    * `class ZOHFusionEngine(QObject)`:
+     * Signals: `qcm_tare_ready = pyqtSignal(int, float)`, `aux_zoh_primed = pyqtSignal(dict)`, `s2_join_complete = pyqtSignal(int, float)`, `fused_row_ready = pyqtSignal(dict)` (includes `"aux_health_ok": cache.health_ok`), `staleness_fault = pyqtSignal(str)`.
+     * Latches `in_s2_a2` and `in_s2_b2` independently during `PRIMING`. At join completion, freezes baseline in `SauerbreyCalculator` and transitions to `STREAMING`.
+     * Evaluates ZOH staleness on every incoming QCM packet ($\text{Age}_{\text{flow}} \le 3.0\text{ s}$, $\text{Age}_{\text{sht}} \le 6.0\text{ s}$) before computing Sauerbrey derivatives.
 
-     * Signals: `qcm_tare_ready = pyqtSignal(int, float)`, `aux_zoh_primed = pyqtSignal(dict)`, `s2_join_complete = pyqtSignal(int, float)`, `fused_row_ready = pyqtSignal(dict)`, `staleness_fault = pyqtSignal(str)`.
+2. **`software/pipeline/sauerbrey.py`**
 
-     * Orthogonal State Flags: `in_s2_a2: bool` (`QCM_TARE_READY`) and `in_s2_b2: bool` (`AUX_ZOH_PRIMED`).
+   * `class SauerbreyCalculator`: Computes baseline subtraction $\Delta f_{\text{particle}}$, finite-difference derivative $\frac{df}{dt}$, and mass deposition rate $\frac{dm}{dt}$ using calibrated crystal constant $C_{\text{QCM}} = 0.0567\text{ ng}\cdot\text{cm}^{-2}\cdot\text{Hz}^{-1}$.
 
-     * `ingest_qcm(self, ts: float, freq_hz: int, qcm_temp_c: float) -> None`: Handles `S2.A1 -> S2.A2` latching during tare, or executes `S3` ZOH staleness verification ($\text{ts} - \text{last\_flow\_ts} \le 3.0\text{ s}$ and $\text{ts} - \text{last\_sht\_ts} \le 6.0\text{ s}$), Sauerbrey computation, and `fused_row_ready` emission during streaming.
+3. **`software/pipeline/csv_logger.py`**
 
-     * `ingest_aux(self, ts: float, aux_data: dict) -> None`: Handles `S2.B1 -> S2.B2` ZOH priming (when `health_ok == True`) and `S3` ZOH cache refresh (updating `last_flow_ts` on every valid AUX packet and `last_sht_ts` when `fresh_flag == True`).
+   * `class CSVLogger`: Opens session CSV (`data/sessions/session_YYYYMMDD_HHMMSS.csv`) on `S1 -> S2`, appends $1\text{ Hz}$ fused rows in `S3`, and safely flushes and closes file handles on `S4: FAULT` or application shutdown.
 
-     * `check_s2_join(self) -> None`: Evaluates `if self.in_s2_a2 and self.in_s2_b2:`; freezes baseline in `SauerbreyCalculator` and emits `s2_join_complete`.
+4. **`software/pipeline/quality.py`**
+
+   * Pure-Python wire validators and regex matchers: `parse_qcm_line()`, `parse_aux_line()`, `is_aux_health_ok()`, `is_valid_pwm_duty()`, and timing invariants (`QCM_TIMEOUT_S = 3.0`, `FLOW_TIMEOUT_S = 3.0`, `SHT_TIMEOUT_S = 6.0`).
+
+5. **`software/pipeline/empirical_fit.py`**
+
+   * Integrates airflow-normalized SMPS dose $D_{\text{SMPS}}(t)$ and solves for empirical scaling factor $K_{\text{empirical}}$.
+
+#### E. `/software/tests/` — Hardware-Decoupled Verification Suite
+
+1. **`software/tests/conftest.py`**
+
+   * Session-scoped `qapp` fixture (`QCoreApplication` / `QApplication` with offscreen platform), `pump(app, seconds)` event processor, and `wait_until(app, predicate, timeout)` helper for robust asynchronous testing.
+
+2. **`software/tests/serial_mock.py`**
+
+   * Synthetic data sources (`SyntheticFPGASource`, `SyntheticESP32Source`) and mock reader classes (`MockQCMReader`, `MockAuxReader`) generating authentic $1\text{ Hz}$ ASCII lines with noise and simulated aerosol deposition ramps.
+
+3. **`software/tests/virtual_loopback.py`**
+
+   * Multi-backend loopback testing framework:
+     * `class InProcessLoopbackPair`: Pure in-memory cross-wired byte pipes (`_BytePipe` / `LoopbackSerialEndpoint`) emulating full pyserial stream behavior and disconnect exceptions across all OS platforms without kernel drivers.
+     * `class VirtualLoopbackHarness`: End-to-end loopback orchestrator running simulated FPGA and ESP32 device threads against `QCMReader` and `AuxReader`.
+     * `class OSSerialPair`: OS-level virtual serial port support (POSIX `openpty` or Windows `com0com`).
+
+4. **`software/tests/test_host_fsm.py`**
+
+   * 37 pure-Python unit tests covering declarative `HostStateMachine(StateChart)` transitions (`boot`, `start_run`, `join_completed`, `fan_pwm_changed`, `fault`, `fault_confirmed`, `shutdown`), guard condition enforcement, `TransitionNotAllowed` assertions, deep history restoration, and action error escalation.
+
+5. **`software/tests/test_pipeline.py`**
+
+   * 56 full-stack integration tests covering wire parsing, ZOH latching, Sauerbrey calculations, virtual loopback communication, `ApplicationController`, and `MainWindow` UI updates.
 
 ## 5. Mathematical & Signal Processing Formulations
 
@@ -460,7 +458,7 @@ pc_timestamp_s,qcm_freq_hz,delta_f_hz,df_dt_hz_s,dm_dt_ng_s,qcm_temp_c,flow_lpm,
 
 ## 6. Hardware-Decoupled Simulation & Verification (`--mock` & Loopback)
 
-Agents and developers must verify all Host PC functionality without physical sensors using two built-in simulation tiers:
+Agents and developers must verify all Host PC functionality without physical sensors using three built-in simulation and loopback tiers:
 
 ### Tier 1: In-Process `--mock` Mode (`software/tests/serial_mock.py`)
 
@@ -470,46 +468,54 @@ Running `python -m software.gui.app --mock` substitutes physical `pyserial` hand
 
 * **Synthetic ESP32 Stream:** Alternates `FRESH=1` (even ticks, `E2.1`) and `FRESH=0` (odd ticks, `E2.2`) SHT21 values every $1\text{ s}$, scales simulated D6F flow rate with `current_pwm`, and parses incoming `SET_PWM:<duty>\n` commands.
 
-### Tier 2: OS Virtual Serial Port Loopback (`software/tests/virtual_loopback.py`)
+### Tier 2: Virtual Serial Port Loopback (`software/tests/virtual_loopback.py`)
 
 Tests the full `pyserial` OS kernel buffer stack (`reset_input_buffer()`, port disconnects, `SerialException`):
 
-* **Linux / macOS (`socat` / `pty`):**
+1. **Cross-Platform In-Process Loopback (`InProcessLoopbackPair` & `VirtualLoopbackHarness`):**
+   * Default backend for unit and integration testing.
+   * Employs cross-wired thread-safe in-memory byte streams (`_BytePipe` / `LoopbackSerialEndpoint`) that replicate `pyserial` semantics (`readline`, `read`, `write`, `in_waiting`, `reset_input_buffer`, `simulate_disconnect`) on Windows, macOS, and Linux without requiring OS driver installations or administrator privileges.
 
-  ```
-  socat -d -d pty,raw,echo=0,link=/tmp/ttyV_QCM_TX pty,raw,echo=0,link=/tmp/ttyV_QCM_RX &
-  socat -d -d pty,raw,echo=0,link=/tmp/ttyV_AUX_TX pty,raw,echo=0,link=/tmp/ttyV_AUX_RX &
-  python -m software.tests.serial_mock --qcm-tx /tmp/ttyV_QCM_TX --aux-tx /tmp/ttyV_AUX_TX &
-  python -m software.gui.app --qcm-port /tmp/ttyV_QCM_RX --aux-port /tmp/ttyV_AUX_RX
-  
-  ```
+2. **OS-Level Virtual COM Ports:**
+   * **Linux / macOS (`socat` / `pty`):**
+     ```bash
+     socat -d -d pty,raw,echo=0,link=/tmp/ttyV_QCM_TX pty,raw,echo=0,link=/tmp/ttyV_QCM_RX &
+     socat -d -d pty,raw,echo=0,link=/tmp/ttyV_AUX_TX pty,raw,echo=0,link=/tmp/ttyV_AUX_RX &
+     python -m software.tests.serial_mock --qcm-tx /tmp/ttyV_QCM_TX --aux-tx /tmp/ttyV_AUX_TX &
+     python -m software.gui.app --qcm-port /tmp/ttyV_QCM_RX --aux-port /tmp/ttyV_AUX_RX
+     ```
+   * **Windows (`com0com`):** Pair `COM10 <-> COM11` (FPGA) and `COM12 <-> COM13` (ESP32).
 
-* **Windows (`com0com`):** Pair `COM10 <-> COM11` (FPGA) and `COM12 <-> COM13` (ESP32).
+### Tier 3: Headless CLI Verification (`software.fsm.headless`)
+
+Enables automated testing, CI/CD validation, and long-duration benchmarking without GUI display server requirements:
+
+```bash
+python -m software.fsm.headless --mock --duration 30 --pwm 75@12
+```
+
+Validates automated connection (`S0 -> S1`), session start (`S1 -> S2`), orthogonal priming join (`S2 -> S3`), streaming row telemetry logging, scheduled Fan PWM actuation (`S5 -> H`), and clean exit on timeout or auto-confirmed fault.
 
 ## 7. Agentic Implementation Roadmap & Acceptance Tests
 
-When implementing or modifying the `/software` stack, coding agents must execute tasks in the following dependency order and run `pytest software/tests/test_pipeline.py` after each step:
+When implementing or modifying the `/software` stack, coding agents must execute tasks in the following dependency order and run the respective test suites after each step:
 
 1. **Step 1 — Pipeline Data Structures & Math (`software/pipeline/`):**
-
    * Implement `quality.py`, `sauerbrey.py`, `zoh_fusion.py`, and `csv_logger.py`.
-
-   * *Acceptance Test:* `pytest` verifies that `ZOHFusionEngine` blocks `S3` entry until both `S2.A2` and `S2.B2` latch, accurately computes $\Delta f_{\text{particle}}$ and $\frac{dm}{dt}$, and emits `staleness_fault` when $\text{Age}_{\text{flow}} > 3.0\text{ s}$ or $\text{Age}_{\text{sht}} > 6.0\text{ s}$.
+   * *Acceptance Test:* `pytest software/tests/test_pipeline.py` verifies that `ZOHFusionEngine` blocks `S3` entry until both `S2.A2` and `S2.B2` latch, accurately computes $\Delta f_{\text{particle}}$ and $\frac{dm}{dt}$, and emits `staleness_fault` when $\text{Age}_{\text{flow}} > 3.0\text{ s}$ or $\text{Age}_{\text{sht}} > 6.0\text{ s}$.
 
 2. **Step 2 — Asynchronous Serial Workers (`software/readers/`):**
-
    * Implement `serial_worker.py`, `qcm_reader.py`, and `aux_reader.py`.
+   * *Acceptance Test:* `pytest` verifies regex parsing of positive and negative `TEMP_X16` values (`-000080` $\to -5.0^\circ\text{C}$), non-blocking worker thread execution, thread-safe TX queuing with `bytes_transmitted` emission, and $3.0\text{ s}$ / $6.0\text{ s}$ watchdog fault emission.
 
-   * *Acceptance Test:* `pytest` verifies regex parsing of positive and negative `TEMP_X16` values (`-000080` $\to -5.0^\circ\text{C}$), rejection of malformed ASCII lines without crashing, and $3.0\text{ s}$ / $6.0\text{ s}$ watchdog fault emission.
+3. **Step 3 — Declarative UML StateChart Control Plane (`software/fsm/`):**
+   * Implement `host_fsm.py` (`HostStateMachine` using `statemachine.StateChart`), `host_controller.py` (`HostController`), and `headless.py`.
+   * *Acceptance Test:* `pytest software/tests/test_host_fsm.py` (37/37 passing) verifies declarative state transitions, `TransitionNotAllowed` rejection, orthogonal region concurrency, Deep History restoration on `S5_PWM_FAN` return, action delegation via `HostActions(Protocol)`, and fault escalation.
 
-3. **Step 3 — Mock Generators & Loopback Harness (`software/tests/`):**
+4. **Step 4 — Mock Generators & Virtual Loopback Harness (`software/tests/`):**
+   * Implement `conftest.py`, `serial_mock.py`, `virtual_loopback.py` (`InProcessLoopbackPair`, `VirtualLoopbackHarness`), and `test_pipeline.py`.
+   * *Acceptance Test:* Full integration test suite passes (56/56 passing) verifying end-to-end loopback data flow, session CSV logging, and fault propagation across virtual ports.
 
-   * Implement `serial_mock.py`, `virtual_loopback.py`, and `test_pipeline.py`.
-
-   * *Acceptance Test:* Full headless integration test passes `S0 -> S1 -> S2 -> S3 -> S5 -> S3 -> S4 -> S0` state transitions.
-
-4. **Step 4 — PyQt6 GUI & FSM Controller (`software/gui/`):**
-
-   * Implement `status_indicator.py`, `dynamic_ribbon.py`, `time_series_view.py`, `diagnostic_view.py`, `main_window.py`, and `app.py`.
-
-   * *Acceptance Test:* Launch `python -m software.gui.app --mock`, verify 60 FPS live plotting across `S1`–`S3`, verify `SET_PWM:<duty>\n` dispatch and History `(H)` restoration on slider drag, and confirm modal fault recovery on simulated cable disconnect.
+5. **Step 5 — PyQt6 GUI & Presentation Layer (`software/gui/`):**
+   * Implement `status_indicator.py`, `dynamic_ribbon.py`, `time_series_view.py`, `diagnostic_view.py` (without COM port dropdowns), `main_window.py`, `base.py`, and `app.py`.
+   * *Acceptance Test:* Run full test suite `pytest` (all 93 tests pass). Verify live GUI smoke test with `python -m software.gui.app --mock` (60 FPS plotting, S1-S3 transitions, S5 Fan PWM slider, modal fault popup recovery) and headless smoke test with `python -m software.fsm.headless --mock --duration 5 --pwm 75@2`.

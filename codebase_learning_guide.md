@@ -18,7 +18,7 @@ To convert raw frequency shifts into calibrated particulate concentrations and m
 3. **Reference Instrument (SMPS Calibration):** Offline or live file ingestion from a Scanning Mobility Particle Sizer (TSI SMPS), which provides golden-standard volumetric concentration ($C_{\text{SMPS}}$ in $\mu\text{g/m}^3$) to extract an empirical calibration factor ($K_{\text{empirical}}$) via an integral dose transform.
 
 ### 1.2 Technology Stack
-* **Language:** Python 3.10+ (using strict type hints, `dataclasses`, `enum.Enum`, `typing.Protocol`, and `collections.deque`).
+* **Language & State Machine:** Python 3.10+ (using strict type hints, `dataclasses`, `enum.Enum`, and `typing.Protocol`); `python-statemachine` 3.2.2 (`statemachine.StateChart`) for declarative UML statecharts.
 * **GUI & Visualization:** PyQt6 (`QtWidgets`, `QtCore`, `QtGui`) for GUI layout and signal/slot event routing; `pyqtgraph` for hardware-accelerated 60 FPS multi-waveform plotting.
 * **Serial Communications:** `pyserial` managing two independent USB-UART VCP links at 115,200 baud (`8N1`).
 * **Data Processing & Analytics:** `numpy` (vectorized math, trapezoidal integration), `pandas` (time-series analysis, SMPS tabular data), `scipy` (least-squares regressions).
@@ -56,7 +56,7 @@ flowchart TD
     end
 
     subgraph ControlPlane["Host PC: Control Plane (software/fsm)"]
-        FSM["HostStateMachine<br/>Pure Python Hierarchical FSM<br/>S0 -> S1 -> S2 -> S3 -> S4 / S5 (H)"]
+        FSM["HostStateMachine<br/>Declarative StateChart (python-statemachine)<br/>S0 -> S1 -> S2 -> S3 -> S4 / S5 (H)"]
         HostCtrl["HostController (QObject)<br/>Qt Signal/Slot Orchestrator"]
     end
 
@@ -143,21 +143,26 @@ To understand the codebase thoroughly, avoid jumping into the GUI first. Follow 
 
 ---
 
-### Step 4: The Pure Control Plane — [`host_fsm.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L1-L476)
-* **Purpose:** Implements the hierarchical Host PC Finite State Machine without Qt, GUI, or serial dependencies.
-* **State Topology:**
-  * `S0_DISCONNECTED`: Initial unpowered or disconnected state.
-  * `HS_CONNECTED`: OR-superstate encompassing `S1`, `S2`, and `S3`.
-  * `S1_IDLE_STANDBY`: Serial ports open; background threads active; waiting for user "Start Run".
-  * `S2_TARE_AND_PRIME`: AND-superstate running two parallel orthogonal regions:
-    * Region `S2.2` (QCM): `A1_WAIT_QCM_FIRST` $\to$ `A2_QCM_TARE_READY`
-    * Region `S2.1` (AUX): `B1_WAIT_AUX_FIRST` $\to$ `B2_AUX_ZOH_PRIMED`
-  * `S3_ACTIVE_STREAMING`: Dual tare join complete; 1 Hz real-time fusion and CSV writing active.
-  * `S4_FAULT`: Group preemptive exit state triggered by any serial exception or watchdog timeout.
-  * `S5_PWM_FAN`: Transient state transmitting fan duty commands, returning immediately to the prior substate via the History pseudostate `H`.
-* **Non-Obvious Logic:**
-  * **Protocol-Based Delegation:** [`HostActions`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L118-L163) defines an abstract interface for side effects (`open_hardware`, `begin_session`, `park_hardware`, etc.). The FSM itself never touches hardware or GUI widgets.
-  * **Run-to-Completion (RTC) Queue:** In [`_dispatch()`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L422-L436), if an action handler triggers a secondary event while the FSM is already processing a transition (e.g., an error during `begin_session` escalating to `fault`), the event is appended to `self._queue` and processed sequentially once the current transition completes.
+### Step 4: The Pure Control Plane — [`host_fsm.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L1-L315)
+* **Purpose:** Implements the hierarchical Host PC Finite State Machine without Qt, GUI, or serial dependencies, powered declaratively by `python-statemachine` (v3.2.2 `StateChart`).
+* **Zero-Adapter Declarative Topology:**
+  * Direct public transition definitions (no `ev_*` indirection, wrappers, or custom `Transition` switch):
+    * `boot`: `s0_disconnected -> hs_connected.s1_idle` (guarded by `guard_ports_available` and `guard_open_hardware`).
+    * `start_run`: `hs_connected.s1_idle -> hs_connected.s2_tare_prime` (guarded by `guard_ports_healthy`, triggers `do_begin_session`).
+    * `qcm_tare_ready`: `r_qcm.a1 -> r_qcm.a2` (within orthogonal region `r_qcm`).
+    * `aux_zoh_primed`: `r_aux.b1 -> r_aux.b2` (within orthogonal region `r_aux`).
+    * `join_completed`: `hs_connected.s2_tare_prime -> hs_connected.s3_active` (guarded by `in_s2_a2 and in_s2_b2`, triggers `do_begin_streaming`).
+    * `fan_pwm_changed`: `hs_connected -> s5_pwm_fan` (guarded by `guard_valid_duty`, stores history, triggers `do_transmit_pwm`).
+    * Eventless return: `s5_pwm_fan -> hs_connected.h` (guarded by `can_return_from_s5`, restores deep active configuration).
+    * `fault`: `(hs_connected | s5_pwm_fan) -> s4_fault` (triggers `do_park_hardware`, group preemptive exit).
+    * `fault_confirmed`: `s4_fault -> s0_disconnected` (triggers `do_clear_fault`).
+    * `shutdown`: `(hs_connected | s4_fault | s5_pwm_fan) -> s0_disconnected` and `s0.to.itself(internal=True)` (triggers `do_terminate`).
+* **Non-Obvious Logic & StateChart Mechanisms:**
+  * **Protocol-Based Delegation:** [`HostActions`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L120-L165) defines an abstract interface for side effects (`open_hardware`, `begin_session`, `park_hardware`, etc.). The FSM never touches hardware or GUI widgets.
+  * **Native Exception Model (`TransitionNotAllowed`):** Without procedural wrappers or artificial `last_rejection` attributes, any invalid transition or failing guard raises `statemachine.exceptions.TransitionNotAllowed`. Callers (such as [`HostController`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_controller.py)) catch this directly in Qt slots, providing idiomatic error handling.
+  * **Native SCXML Run-to-Completion (RTC) Engine:** Transition actions (`do_begin_session`, `do_begin_streaming`, `do_transmit_pwm`, `do_park_hardware`, `do_clear_fault`, `do_terminate`) execute *inside* `StateChart`'s macrostep. If an action synchronously triggers a secondary event (e.g. an action failure calling `fault()` or a modal fault confirmation calling `fault_confirmed()`), `StateChart`'s internal SCXML RTC queue defers execution until the active macrostep finishes, guaranteeing deterministic FIFO processing.
+  * **Observer & Listener Support:** `HostController` registers via `fsm.add_listener(self)` and implements `after_transition(self, event, source, target)` to emit Qt control signals (`state_changed`, `s2_progress`). Transition listeners are isolated so exceptions in custom listeners do not corrupt FSM state.
+  * **Configuration Queries:** Properties (`state`, `is_connected`, `in_s2_a2`, `in_s2_b2`, `qcm_region`, `aux_region`, `active_configuration`) inspect `self.configuration` directly.
 
 ---
 
@@ -216,9 +221,9 @@ The following structured curriculum groups the technical concepts used in the re
 
 | Area | Concept | Where Used in Code | Difficulty | Suggested Learning Resource |
 | :--- | :--- | :--- | :--- | :--- |
-| **Language Fundamentals** | Type Hinting & `Protocol` (PEP 544 Structural Subtyping) | [`HostActions` in host_fsm.py#L118](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L118) | Intermediate | Python Official Docs: `typing.Protocol` |
-| **Language Fundamentals** | Dataclasses & Enums | [`HostState` in host_fsm.py#L63](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L63) | Beginner | Python Official Docs: `dataclasses` & `enum` |
-| **Language Fundamentals** | Run-to-Completion Event Queues & Deque | [`HostStateMachine._dispatch` in host_fsm.py#L422](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L422) | Intermediate | UML Statecharts / Miro Samek: *Practical Statecharts* |
+| **Language Fundamentals** | Type Hinting & `Protocol` (PEP 544 Structural Subtyping) | [`HostActions` in host_fsm.py#L120](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L120) | Intermediate | Python Official Docs: `typing.Protocol` |
+| **Language Fundamentals** | Dataclasses & Enums | [`HostState` in host_fsm.py#L64](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L64) | Beginner | Python Official Docs: `dataclasses` & `enum` |
+| **FSM & Statecharts** | Declarative UML StateCharts & SCXML Run-to-Completion (RTC) | [`HostStateMachine` in host_fsm.py#L203](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py#L203) | Intermediate | `python-statemachine` (v3.2.2) Docs / SCXML Specification |
 | **Language Fundamentals** | Context Managers & Generator Fixtures | [`VirtualLoopbackHarness` in virtual_loopback.py#L343](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/tests/virtual_loopback.py#L343) | Intermediate | Python Docs: `contextlib` & `yield` statements |
 | **Libraries & Frameworks** | Qt Signals and Slots across Thread Boundaries | [`HostController._bind_workers` in host_controller.py#L177](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_controller.py#L177) | Intermediate | PyQt6 Official Documentation / Qt Core Model |
 | **Libraries & Frameworks** | Multithreaded Worker Pattern (`QThread` vs UI Thread) | [`BaseSerialWorker.run` in serial_worker.py#L145](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/readers/serial_worker.py#L145) | Advanced | Maya Posch: *How To Really, Truly Use QThreads; The Right Way* |
@@ -368,7 +373,7 @@ This table rates how challenging each file would be for a student team member to
 
 | Module / File | Risk Rating | Why It's Risky & Common AI Signatures | Review Defense Questions to Prepare For |
 | :--- | :---: | :--- | :--- |
-| [`software/fsm/host_fsm.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py) | **HIGH** | Uses formal UML Statechart theory: orthogonal regions, History pseudostates `(H)`, `typing.Protocol` dependency injection, and a run-to-completion re-entrant event queue (`_busy` + `deque`). Highly sophisticated design that faculty will immediately probe. | *"What is an orthogonal region, and why does S2 need two of them?"*<br/>*"What happens if an action raises an exception while processing a transition?"* |
+| [`software/fsm/host_fsm.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py) | **HIGH** | Uses formal UML Statechart theory via `python-statemachine` (v3.2.2 `StateChart`): orthogonal regions (`State.Parallel`), deep history pseudostate `H` (`HistoryState(type=HistoryType.DEEP)`), eventless return transitions, `cond=` transition guards, `typing.Protocol` dependency injection (`HostActions`), and native SCXML Run-to-Completion (RTC) queuing. Highly sophisticated design that faculty will probe. | *"What is an orthogonal region, and why does S2 need two of them?"*<br/>*"How does python-statemachine handle re-entrant events or action failures via SCXML RTC?"* |
 | `software/tests/_pytest_shim.py` (deleted) | **REMOVED** (Was HIGH) | File and its hooks were removed from the codebase. Full test suite now relies cleanly on standard `pytest` declared in `requirements.txt`. | N/A (file deleted) |
 | [`software/readers/serial_worker.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/readers/serial_worker.py) | **HIGH** | Cross-thread concurrency using `threading.Event`, `queue.Queue`, partial-line buffer slicing (`_rx_buf`), and non-blocking polling loops. Threading deadlocks and race conditions are favorite faculty review questions. | *"Why don't you call ser.readline() directly from the GUI thread?"*<br/>*"Why is input buffer resetting forbidden when changing fan PWM?"* |
 | [`software/pipeline/zoh_fusion.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/pipeline/zoh_fusion.py) | **HIGH** | Multi-rate data fusion logic, timestamp skew compensation, and floating baseline tracking before the join. Students often confuse tare logic with running derivative math. | *"Why can a QCM sample have a negative age relative to an AUX sample?"*<br/>*"Why does the baseline keep updating while in S2?"* |
@@ -383,7 +388,7 @@ This table rates how challenging each file would be for a student team member to
 ---
 
 ### Priority Files for Team Study and Hands-On Rewriting
-1. **[`host_fsm.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py):** The team MUST understand the state diagram, transitions, and why orthogonal regions were chosen over a flat state machine.
+1. **[`host_fsm.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py):** The team MUST understand the state diagram, transitions, why orthogonal regions (`State.Parallel`) were chosen over a flat state machine, and how `python-statemachine` executes declarative guards (`cond=`) and deep history (`HistoryState`).
 2. **[`zoh_fusion.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/pipeline/zoh_fusion.py):** Students must understand how 1 Hz and 0.5 Hz asynchronous telemetry are combined without race conditions.
 3. **[`serial_worker.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/readers/serial_worker.py):** Students must be able to draw the threading diagram on a whiteboard showing the GUI thread, the two worker threads, the queues, and the signal channels.
 
@@ -426,18 +431,18 @@ A four-week structured study and mastery roadmap to ensure 100% team ownership o
 ---
 
 ### Week 3: Hierarchical State Machine & Data Fusion
-* **Objective:** Master the Host control plane and the multi-rate ZOH fusion engine.
+* **Objective:** Master the Host control plane (`python-statemachine` `StateChart`) and the multi-rate ZOH fusion engine.
 * **Files to Study:**
   * [`host_fsm.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_fsm.py)
   * [`zoh_fusion.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/pipeline/zoh_fusion.py)
   * [`host_controller.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/fsm/host_controller.py)
   * [`test_host_fsm.py`](file:///c:/Users/Kevin%20Wu/Projects%20(Offline)/ECE_CAPSTONE/code/software/tests/test_host_fsm.py)
 * **Hands-on Exercise:**
-  * Draw the complete state transition diagram from memory on a whiteboard, including orthogonal states `S2.A1`/`S2.A2` and `S2.B1`/`S2.B2`, history pseudostate `H`, and `S4: FAULT`.
+  * Draw the complete state transition diagram from memory on a whiteboard, including compound superstate `HS_CONNECTED`, orthogonal parallel regions `r_qcm` (`S2.A1`/`S2.A2`) and `r_aux` (`S2.B1`/`S2.B2`), Deep History pseudostate `H`, eventless return from `S5: PWM_FAN`, and `S4: FAULT`.
   * Run the FSM test suite with `conda activate ECE` then `python -m pytest software/tests/test_host_fsm.py -v`, and read through every test case (37 FSM tests; the full suite is 93).
 * **Self-Quiz Questions:**
   1. *Why is `HostStateMachine` decoupled from PyQt6?* (Answer: It enables 100% deterministic unit testing without spinning up Qt event loops, displays, or platform abstraction layers).
-  2. *What is the join condition to enter S3?* (Answer: Both orthogonal regions must be latched: `in_s2_a2` [valid QCM packet received] and `in_s2_b2` [valid AUX packet with health flag `OK=1` received]).
+  2. *What is the join condition to enter S3?* (Answer: Both orthogonal regions must be latched: `in_s2_a2` [valid QCM packet received] and `in_s2_b2` [valid AUX packet with health flag `OK=1` received], evaluated declaratively via `cond="guard_join"` on `ev_join`).
 
 ---
 
@@ -459,4 +464,4 @@ A four-week structured study and mastery roadmap to ensure 100% team ownership o
 ---
 
 > [!TIP]
-> **Summary for Academic Defense:** The software architecture is cleanly separated into three layers: **Control Plane** (`HostStateMachine`, pure Python), **Data Plane** (`ZOHFusionEngine`, multi-rate math), and **I/O Plane** (`BaseSerialWorker`, multithreaded non-blocking serial). Emphasize this separation during presentation slides to demonstrate professional systems engineering rigor.
+> **Summary for Academic Defense:** The software architecture is cleanly separated into three layers: **Control Plane** (`HostStateMachine`, declarative UML `StateChart`), **Data Plane** (`ZOHFusionEngine`, multi-rate math), and **I/O Plane** (`BaseSerialWorker`, multithreaded non-blocking serial). Emphasize this separation during presentation slides to demonstrate professional systems engineering rigor.
