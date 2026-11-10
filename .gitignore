@@ -10,6 +10,8 @@ env/
 *.parquet
 *.sqlite3
 data/sessions/
+.agents/
+.conda/
 
 # === Vivado / Basys 3 FPGA Artifacts ===
 *.jou

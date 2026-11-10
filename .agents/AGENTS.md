@@ -1,4 +1,4 @@
-Environment Path: C:\Users\Kevin Wu\miniconda3\envs\ECE
+Environment Path: .\.conda (Use `.\.conda\python.exe` for all Python/test/lint commands; never scan or search inside `.conda/`)
 
 # Token and Credit Optimization Rules
 - Never scan entire directory trees or inspect multi-file diffs inside the primary context window.
