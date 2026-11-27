@@ -9,6 +9,7 @@ env/
 *.csv                  # Ignore session data dumps / test run CSVs
 *.parquet
 *.sqlite3
+*.conda
 
 # === Vivado / Basys 3 FPGA Artifacts ===
 *.jou
