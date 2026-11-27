@@ -2,7 +2,7 @@
 name: scout
 description: Fast, credit-efficient subagent for factual codebase search, file/line locating, test running, and executing concrete atomic tasks specified by the main model.
 subagent: true
-model: gemini-3.8-flash
+model: gemini-4-hydrogen
 thinking: high
 tools:
   - read_file

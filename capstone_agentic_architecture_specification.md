@@ -350,7 +350,7 @@ ece490-qcm-platform/
 
 2. **`software/pipeline/sauerbrey.py`**
 
-   * `class SauerbreyCalculator`: Computes baseline subtraction $\Delta f_{\text{particle}}$, finite-difference derivative $\frac{df}{dt}$, and mass deposition rate $\frac{dm}{dt}$ using calibrated crystal constant $C_{\text{QCM}} = 0.0567\text{ ng}\cdot\text{cm}^{-2}\cdot\text{Hz}^{-1}$.
+   * `class SauerbreyCalculator`: Computes baseline subtraction $\Delta f_{\text{particle}}$, finite-difference derivative $\frac{df}{dt}$, and mass deposition rate $\frac{dm}{dt}$ using calibrated crystal constant $C_{\text{QCM}} = \frac{A\sqrt{\rho_q \mu_q}}{2 f_0^2} \times 10^9$ ($\approx 3.622\text{ ng/Hz}$ at nominal $f_0 = 5.0\text{ MHz}$, $A = 0.205\text{ cm}^2$)
 
 3. **`software/pipeline/csv_logger.py`**
 
@@ -419,7 +419,7 @@ $$
 Using the standard Sauerbrey relation for an AT-cut quartz crystal with fundamental resonant frequency $f_0 \approx 5.0 \times 10^6\text{ Hz}$, active electrode area $A = 0.205\text{ cm}^2$, quartz density $\rho_q = 2.648\text{ g/cm}^3$, and shear modulus $\mu_q = 2.947 \times 10^{11}\text{ g}\cdot\text{cm}^{-1}\cdot\text{s}^{-2}$:
 
 $$
-\Delta m(t_k) = -\left(\frac{A\sqrt{\rho_q \mu_q}}{2 f_0^2}\right) \Delta f_{\text{particle}}(t_k) = -C_{\text{QCM}} \cdot \Delta f_{\text{particle}}(t_k)
+\Delta m(t_k) = -\left(\frac{A\sqrt{\rho_q \mu_q}}{2 f_0^2}\times 10^9\right) \Delta f_{\text{particle}}(t_k) = -C_{\text{QCM}} \cdot \Delta f_{\text{particle}}(t_k) \quad [\text{ng/Hz}]
 $$
 
 $$
